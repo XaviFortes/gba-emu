@@ -1075,18 +1075,43 @@ impl Cpu {
 
         if trace_bios_loop_enabled() && (0x0000_2B34..=0x0000_2FFF).contains(&curr_pc) {
             println!(
-                "[bios-2b34] pc=0x{:08X} instr=0x{:04X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} key=0x{:04X} joy=0x{:08X}",
+                "[bios-2b34] pc=0x{:08X} instr=0x{:04X} lr=0x{:08X} cpsr=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X}",
                 curr_pc,
                 instr,
+                self.regs[REG_LR],
+                self.cpsr,
                 self.regs[0],
                 self.regs[1],
                 self.regs[2],
                 self.regs[3],
                 self.regs[5],
                 self.regs[6],
+                self.regs[7]
+            );
+        }
+
+        if trace_bios_loop_enabled()
+            && ((0x0000_2C20..=0x0000_2C5C).contains(&curr_pc)
+                || (0x0000_2D56..=0x0000_2D66).contains(&curr_pc))
+        {
+            println!(
+                "[bios-epi] pc=0x{:08X} instr=0x{:04X} lr=0x{:08X} cpsr=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} ie=0x{:04X} if=0x{:04X} ime=0x{:04X} siocnt=0x{:04X}",
+                curr_pc,
+                instr,
+                self.regs[REG_LR],
+                self.cpsr,
+                self.regs[0],
+                self.regs[1],
+                self.regs[2],
+                self.regs[3],
+                self.regs[4],
+                self.regs[5],
+                self.regs[6],
                 self.regs[7],
-                bus.read_io16(super::bus::REG_KEYINPUT),
-                bus.read32(0x0400_0150)
+                bus.read_io16(super::bus::REG_IE),
+                bus.read_io16(super::bus::REG_IF),
+                bus.read_io16(super::bus::REG_IME),
+                bus.read_io16(0x0400_0128)
             );
         }
 
@@ -1578,16 +1603,27 @@ impl Cpu {
         // Conditional branch.
         if (instr & 0xF000) == 0xD000 && (instr & 0x0F00) != 0x0F00 {
             let cond = ((instr >> 8) & 0xF) as u8;
-            if trace_bios_loop_enabled() && (curr_pc == 0x0000_1C66 || (0x0000_1C90..=0x0000_1CA8).contains(&curr_pc)) {
+            if trace_bios_loop_enabled()
+                && (curr_pc == 0x0000_1C66
+                    || (0x0000_1C90..=0x0000_1CA8).contains(&curr_pc)
+                    || (0x0000_2C20..=0x0000_2C5C).contains(&curr_pc))
+            {
+                let taken = self.condition_passed(cond);
+                let imm8 = (instr & 0xFF) as i8;
+                let signed = ((imm8 as i16) << 1) as i32;
+                let target = self.pc().wrapping_add(2).wrapping_add_signed(signed);
                 println!(
-                    "[bios-cond] pc=0x{:08X} r0=0x{:08X} r5=0x{:08X} r7=0x{:08X} cpsr=0x{:08X} cond=0x{:X} taken={} instr=0x{:04X}",
+                    "[bios-cond] pc=0x{:08X} lr=0x{:08X} r0=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} cpsr=0x{:08X} cond=0x{:X} taken={} target=0x{:08X} instr=0x{:04X}",
                     curr_pc,
+                    self.regs[REG_LR],
                     self.regs[0],
                     self.regs[5],
+                    self.regs[6],
                     self.regs[7],
                     self.cpsr,
                     cond,
-                    self.condition_passed(cond),
+                    taken,
+                    target,
                     instr
                 );
             }

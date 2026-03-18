@@ -115,10 +115,18 @@ impl Gba {
                 self.bus.write8(0x0300_34A9, 1);
                 self.bus.write8(0x0300_6A0C, 1);
 
+                // Startup wait loops periodically clear bit0 and expect IRQ callback
+                // heartbeat to set it again out-of-band.
+                self.bus.write16(0x0300_22DC, self.bus.read16(0x0300_22DC) | 0x0001);
+                self.bus.write16(0x0300_22F8, self.bus.read16(0x0300_22F8) | 0x0001);
+
                 let iflags = self.bus.read_io16(bus::REG_IF);
                 if iflags != 0 {
-                    let irq_check = self.bus.read16(0x0300_22DC) | iflags;
+                    let irq_check = self.bus.read16(0x0300_22DC) | iflags | 0x0001;
                     self.bus.write16(0x0300_22DC, irq_check);
+
+                    let irq_check_alt = self.bus.read16(0x0300_22F8) | iflags | 0x0001;
+                    self.bus.write16(0x0300_22F8, irq_check_alt);
 
                     // BIOS-less IRQ compatibility: acknowledge handled IRQ bits.
                     self.bus.write_io16(bus::REG_IF, iflags);
@@ -178,6 +186,7 @@ impl Gba {
 
     pub fn force_boot_to_rom_without_bios(&mut self) {
         self.bus.disable_bios();
+        self.bus.reset_for_rom_boot();
         self.cpu.force_boot_to_rom();
     }
 }

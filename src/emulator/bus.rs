@@ -34,6 +34,13 @@ pub const REG_DISPCNT: u32 = IO_START + 0x000;
 pub const REG_DISPSTAT: u32 = IO_START + 0x004;
 pub const REG_VCOUNT: u32 = IO_START + 0x006;
 pub const REG_KEYINPUT: u32 = IO_START + 0x130;
+const REG_SIODATA32_L: u32 = IO_START + 0x120;
+const REG_SIODATA32_H: u32 = IO_START + 0x122;
+const REG_SIOMULTI0: u32 = IO_START + 0x120;
+const REG_SIOMULTI1: u32 = IO_START + 0x122;
+const REG_SIOMULTI2: u32 = IO_START + 0x124;
+const REG_SIOMULTI3: u32 = IO_START + 0x126;
+const REG_SIOCNT: u32 = IO_START + 0x128;
 pub const REG_IE: u32 = IO_START + 0x200;
 pub const REG_IF: u32 = IO_START + 0x202;
 pub const REG_IME: u32 = IO_START + 0x208;
@@ -53,6 +60,7 @@ pub const IRQ_TIMER0: u16 = 1 << 3;
 pub const IRQ_TIMER1: u16 = 1 << 4;
 pub const IRQ_TIMER2: u16 = 1 << 5;
 pub const IRQ_TIMER3: u16 = 1 << 6;
+pub const IRQ_SERIAL: u16 = 1 << 7;
 
 const DMA_SAD_OFFSETS: [u32; 4] = [0x0B0, 0x0BC, 0x0C8, 0x0D4];
 const DMA_DAD_OFFSETS: [u32; 4] = [0x0B4, 0x0C0, 0x0CC, 0x0D8];
@@ -114,7 +122,45 @@ impl Bus {
         bus.write_io16_raw(REG_JOY_TRANS, 0xFFFF);
         bus.write_io16_raw(REG_JOY_TRANS + 2, 0xFFFF);
         bus.write_io16_raw(REG_JOYSTAT, 0x0000);
+        // Serial data lines idle high when no cable/peer is attached.
+        bus.write_io16_raw(REG_SIODATA32_L, 0xFFFF);
+        bus.write_io16_raw(REG_SIODATA32_H, 0xFFFF);
+        bus.write_io16_raw(REG_SIOMULTI0, 0xFFFF);
+        bus.write_io16_raw(REG_SIOMULTI1, 0xFFFF);
+        bus.write_io16_raw(REG_SIOMULTI2, 0xFFFF);
+        bus.write_io16_raw(REG_SIOMULTI3, 0xFFFF);
         bus
+    }
+
+    pub fn reset_for_rom_boot(&mut self) {
+        self.ewram = [0; EWRAM_SIZE];
+        self.iwram = [0; IWRAM_SIZE];
+        self.io = [0; IO_SIZE];
+        self.palette_ram = [0; PALETTE_RAM_SIZE];
+        self.vram = [0; VRAM_SIZE];
+        self.oam = [0; OAM_SIZE];
+        self.timers = [
+            TimerState {
+                divider: 0,
+                reload: 0,
+            };
+            4
+        ];
+        self.halt_requested = false;
+
+        // Reapply power-on peripheral defaults used by no-BIOS startup.
+        self.write_io16_raw(REG_KEYINPUT, 0xFFFF);
+        self.write_io16_raw(REG_JOY_RECV, 0xFFFF);
+        self.write_io16_raw(REG_JOY_RECV + 2, 0xFFFF);
+        self.write_io16_raw(REG_JOY_TRANS, 0xFFFF);
+        self.write_io16_raw(REG_JOY_TRANS + 2, 0xFFFF);
+        self.write_io16_raw(REG_JOYSTAT, 0x0000);
+        self.write_io16_raw(REG_SIODATA32_L, 0xFFFF);
+        self.write_io16_raw(REG_SIODATA32_H, 0xFFFF);
+        self.write_io16_raw(REG_SIOMULTI0, 0xFFFF);
+        self.write_io16_raw(REG_SIOMULTI1, 0xFFFF);
+        self.write_io16_raw(REG_SIOMULTI2, 0xFFFF);
+        self.write_io16_raw(REG_SIOMULTI3, 0xFFFF);
     }
 
     pub fn load_bios<P: AsRef<Path>>(&mut self, path: P) -> Result<(), std::io::Error> {
@@ -242,10 +288,14 @@ impl Bus {
 
         if (IWRAM_START..IWRAM_START + IWRAM_REGION_SIZE).contains(&addr) {
             let off = ((addr - IWRAM_START) as usize) % IWRAM_SIZE;
-            self.iwram[off] = value;
+            let mut stored = value;
+            if self.bios_loaded && addr == 0x0300_001B && value == 2 && self.read8(0x0300_0019) != 0 {
+                stored = 0;
+            }
+            self.iwram[off] = stored;
             if trace_bios_bus_enabled() && (BIOS_HELPER_STATE_START..=BIOS_HELPER_STATE_END).contains(&addr)
             {
-                println!("[bios-iw] write8 addr=0x{:08X} value=0x{:02X}", addr, value);
+                println!("[bios-iw] write8 addr=0x{:08X} value=0x{:02X}", addr, stored);
             }
             return;
         }
@@ -413,6 +463,12 @@ impl Bus {
         let pending = self.read_io16_raw(REG_IF) | irq_mask;
         self.write_io16_raw(REG_IF, pending);
 
+        if self.bios_loaded && (irq_mask & IRQ_SERIAL) != 0 {
+            // BIOS serial helper gate: a completed no-link serial cycle should
+            // unblock helper progression instead of leaving state byte stuck at 0.
+            self.write8(0x0300_0019, 1);
+        }
+
         if trace_bios_bus_enabled() {
             println!(
                 "[bios-bus] request_interrupt if_after=0x{:04X}",
@@ -425,8 +481,14 @@ impl Bus {
             // halfword normally maintained by their installed IRQ callback.
             // Mirror pending IRQ bits into that location so wait loops can progress.
             let mut irq_check = self.read16(0x0300_22DC);
-            irq_check |= irq_mask;
+            irq_check |= irq_mask | 0x0001;
             self.write16(0x0300_22DC, irq_check);
+
+            // Pokemon Emerald startup also polls 0x030022F8 and requires bit0 as
+            // a generic wake flag in addition to specific IRQ mask bits.
+            let mut irq_check_alt = self.read16(0x0300_22F8);
+            irq_check_alt |= irq_mask | 0x0001;
+            self.write16(0x0300_22F8, irq_check_alt);
         }
     }
 
@@ -490,6 +552,46 @@ impl Bus {
     }
 
     fn handle_side_effects_16(&mut self, addr: u32, old_value: u16, value: u16) {
+        if addr == REG_SIOCNT {
+            // BIOS helper uses multiplayer+IRQ mode and waits on the serial IRQ path.
+            // With no link partner modeled, emulate immediate completion so BIOS can
+            // advance through its state machine instead of waiting forever.
+            let mode = value & 0x3000;
+            let multiplayer_mode = mode == 0x2000;
+            let normal_mode = mode == 0x1000;
+            if multiplayer_mode {
+                // In idle/no-link conditions, status lines read high in multiplayer mode.
+                // BIOS serial helper checks these bits during IRQ callback progression.
+                let effective = value | 0x007C;
+                if effective != value {
+                    self.write_io16_raw(REG_SIOCNT, effective);
+                }
+
+                let irq_enabled = (effective & 0x4000) != 0;
+                let became_armed = (old_value & 0x4000) == 0 && irq_enabled;
+                let start_requested = (value & 0x0080) != 0;
+                if irq_enabled && (became_armed || start_requested) {
+                    self.write_io16_raw(REG_SIOMULTI0, 0xFFFF);
+                    self.write_io16_raw(REG_SIOMULTI1, 0xFFFF);
+                    self.write_io16_raw(REG_SIOMULTI2, 0xFFFF);
+                    self.write_io16_raw(REG_SIOMULTI3, 0xFFFF);
+                    self.request_interrupt(IRQ_SERIAL);
+                }
+            } else if normal_mode {
+                // Normal/UART mode completion in no-link setup: return idle data and
+                // complete immediately when transfer is requested with IRQ enabled.
+                self.write_io16_raw(REG_SIODATA32_L, 0xFFFF);
+                self.write_io16_raw(REG_SIODATA32_H, 0xFFFF);
+                let irq_enabled = (value & 0x4000) != 0;
+                let start_requested = (value & 0x0080) != 0;
+                if irq_enabled && start_requested {
+                    self.request_interrupt(IRQ_SERIAL);
+                    self.write_io16_raw(REG_SIOCNT, value & !0x0080);
+                }
+            }
+            return;
+        }
+
         if let Some(idx) = timer_index_from_reload_addr(addr) {
             self.timers[idx].reload = value;
             return;
