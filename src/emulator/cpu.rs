@@ -235,20 +235,23 @@ impl Cpu {
         let msr_op = (instr >> 23) & 0x1F;
         let msr_bits_21_20 = (instr >> 20) & 0x3;
         let msr_low_11_4 = (instr >> 4) & 0xFF;
-        if msr_op == 0b00010 && msr_bits_21_20 == 0b10 && msr_low_11_4 == 0 {
+        let msr_rd_bits = ((instr >> 12) & 0xF) as u8;
+        if msr_op == 0b00010 && msr_bits_21_20 == 0b10 && msr_low_11_4 == 0 && msr_rd_bits == 0xF {
             let rm = (instr & 0xF) as usize;
             let field_mask = ((instr >> 16) & 0xF) as u8;
+            let value = self.regs[rm];
             let write_spsr = (instr & (1 << 22)) != 0;
             if write_spsr {
-                self.write_spsr_fields(self.regs[rm], field_mask);
+                self.write_spsr_fields(value, field_mask);
             } else {
-                self.write_cpsr_fields(self.regs[rm], field_mask);
+                self.write_cpsr_fields(value, field_mask);
             }
             return 1;
         }
 
         // MSR CPSR/SPSR fields, #immediate
-        if msr_op == 0b00110 && msr_bits_21_20 == 0b10 {
+        let msr_imm_rd_bits = ((instr >> 12) & 0xF) as u8;
+        if msr_op == 0b00110 && msr_bits_21_20 == 0b10 && msr_imm_rd_bits == 0xF {
             let imm8 = instr & 0xFF;
             let rot = ((instr >> 8) & 0xF) * 2;
             let value = imm8.rotate_right(rot);
