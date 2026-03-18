@@ -1,0 +1,424 @@
+use super::bus::{
+    Bus, IRQ_VBLANK, PALETTE_RAM_START, REG_DISPCNT, REG_DISPSTAT, REG_VCOUNT,
+};
+
+pub const SCREEN_WIDTH: usize = 240;
+pub const SCREEN_HEIGHT: usize = 160;
+
+const SCANLINE_CYCLES: u32 = 1_232;
+const TOTAL_SCANLINES: u16 = 228;
+const VISIBLE_SCANLINES: u16 = 160;
+const REG_BG0CNT: u32 = 0x0400_0008;
+const REG_BG1CNT: u32 = 0x0400_000A;
+const REG_BG2CNT: u32 = 0x0400_000C;
+const REG_BG3CNT: u32 = 0x0400_000E;
+const REG_BG0HOFS: u32 = 0x0400_0010;
+const REG_BG0VOFS: u32 = 0x0400_0012;
+const REG_BG1HOFS: u32 = 0x0400_0014;
+const REG_BG1VOFS: u32 = 0x0400_0016;
+const REG_BG2HOFS: u32 = 0x0400_0018;
+const REG_BG2VOFS: u32 = 0x0400_001A;
+const REG_BG3HOFS: u32 = 0x0400_001C;
+const REG_BG3VOFS: u32 = 0x0400_001E;
+const REG_BG2PA: u32 = 0x0400_0020;
+const REG_BG2PB: u32 = 0x0400_0022;
+const REG_BG2PC: u32 = 0x0400_0024;
+const REG_BG2PD: u32 = 0x0400_0026;
+const REG_BG2X: u32 = 0x0400_0028;
+const REG_BG2Y: u32 = 0x0400_002C;
+const REG_BG3PA: u32 = 0x0400_0030;
+const REG_BG3PB: u32 = 0x0400_0032;
+const REG_BG3PC: u32 = 0x0400_0034;
+const REG_BG3PD: u32 = 0x0400_0036;
+const REG_BG3X: u32 = 0x0400_0038;
+const REG_BG3Y: u32 = 0x0400_003C;
+
+#[derive(Debug)]
+pub struct Ppu {
+    scanline_cycles: u32,
+    framebuffer: Vec<u32>,
+    frame_ready: bool,
+}
+
+impl Ppu {
+    pub fn new() -> Self {
+        Self {
+            scanline_cycles: 0,
+            framebuffer: vec![0; SCREEN_WIDTH * SCREEN_HEIGHT],
+            frame_ready: false,
+        }
+    }
+
+    pub fn tick(&mut self, cycles: u32, bus: &mut Bus, render_video: bool) {
+        self.scanline_cycles = self.scanline_cycles.wrapping_add(cycles);
+
+        while self.scanline_cycles >= SCANLINE_CYCLES {
+            self.scanline_cycles -= SCANLINE_CYCLES;
+
+            let mut vcount = bus.read_io16(REG_VCOUNT);
+            if render_video && vcount < VISIBLE_SCANLINES {
+                self.render_scanline(bus, vcount as usize);
+            }
+
+            vcount = (vcount + 1) % TOTAL_SCANLINES;
+            bus.set_vcount(vcount);
+
+            if vcount == VISIBLE_SCANLINES {
+                self.set_vblank(bus, true);
+                self.frame_ready = true;
+            } else if vcount == 0 {
+                self.set_vblank(bus, false);
+            }
+        }
+    }
+
+    pub fn take_frame_ready(&mut self) -> bool {
+        let ready = self.frame_ready;
+        self.frame_ready = false;
+        ready
+    }
+
+    pub fn framebuffer(&self) -> &[u32] {
+        &self.framebuffer
+    }
+
+    fn set_vblank(&self, bus: &mut Bus, state: bool) {
+        let mut dispstat = bus.read_io16(REG_DISPSTAT);
+        if state {
+            dispstat |= 1;
+            bus.request_interrupt(IRQ_VBLANK);
+        } else {
+            dispstat &= !1;
+        }
+        bus.write_io16(REG_DISPSTAT, dispstat);
+    }
+
+    fn render_scanline(&mut self, bus: &Bus, y: usize) {
+        let dispcnt = bus.read_io16(REG_DISPCNT);
+        let mode = dispcnt & 0b111;
+        match mode {
+            0 => {
+                self.render_mode0_scanline(bus, y, dispcnt);
+            }
+            1 => {
+                // Mode 1 has text BG0/BG1 plus affine BG2.
+                self.render_mode1_scanline(bus, y, dispcnt);
+            }
+            2 => {
+                self.render_mode2_scanline(bus, y, dispcnt);
+            }
+            3 => self.render_mode3_scanline(bus, y),
+            4 => self.render_mode4_scanline(bus, y, dispcnt),
+            _ => self.clear_scanline(y),
+        }
+    }
+
+    fn render_mode4_scanline(&mut self, bus: &Bus, y: usize, dispcnt: u16) {
+        let row_start = y * SCREEN_WIDTH;
+        let frame_base = if (dispcnt & (1 << 4)) != 0 { 0xA000 } else { 0x0000 };
+        let vram = bus.vram();
+
+        for x in 0..SCREEN_WIDTH {
+            let off = frame_base + row_start + x;
+            let index = vram.get(off).copied().unwrap_or(0) as usize;
+            let color = bus.read16(PALETTE_RAM_START + (index * 2) as u32);
+            self.framebuffer[row_start + x] = bgr555_to_argb8888(color);
+        }
+    }
+
+    fn render_mode2_scanline(&mut self, bus: &Bus, y: usize, dispcnt: u16) {
+        let row_start = y * SCREEN_WIDTH;
+        let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
+        for px in &mut self.framebuffer[row_start..row_start + SCREEN_WIDTH] {
+            *px = backdrop;
+        }
+
+        let mut candidates: Vec<(u16, usize)> = Vec::new();
+        for bg in [2usize, 3usize] {
+            if (dispcnt & (1 << (8 + bg))) == 0 {
+                continue;
+            }
+            let cnt = bus.read_io16(bg_cnt_addr(bg));
+            let priority = cnt & 0b11;
+            candidates.push((priority, bg));
+        }
+
+        candidates.sort_by_key(|(priority, _)| *priority);
+
+        for (_, bg) in candidates {
+            self.render_affine_bg_scanline(bus, y, bg);
+        }
+    }
+
+    fn render_mode3_scanline(&mut self, bus: &Bus, y: usize) {
+        let vram = bus.vram();
+        let row_start = y * SCREEN_WIDTH;
+
+        for x in 0..SCREEN_WIDTH {
+            let off = (row_start + x) * 2;
+            let color = u16::from_le_bytes([vram[off], vram[off + 1]]);
+            self.framebuffer[row_start + x] = bgr555_to_argb8888(color);
+        }
+    }
+
+    fn render_mode0_scanline(&mut self, bus: &Bus, y: usize, dispcnt: u16) {
+        let row_start = y * SCREEN_WIDTH;
+        let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
+        for px in &mut self.framebuffer[row_start..row_start + SCREEN_WIDTH] {
+            *px = backdrop;
+        }
+
+        let mut candidates: Vec<(u16, usize)> = Vec::new();
+        for bg in 0..4 {
+            if (dispcnt & (1 << (8 + bg))) == 0 {
+                continue;
+            }
+            let cnt = bus.read_io16(bg_cnt_addr(bg));
+            let priority = cnt & 0b11;
+            candidates.push((priority, bg));
+        }
+
+        candidates.sort_by_key(|(priority, _)| *priority);
+
+        for (_, bg) in candidates {
+            self.render_text_bg_scanline(bus, y, bg);
+        }
+    }
+
+    fn render_mode1_scanline(&mut self, bus: &Bus, y: usize, dispcnt: u16) {
+        let row_start = y * SCREEN_WIDTH;
+        let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
+        for px in &mut self.framebuffer[row_start..row_start + SCREEN_WIDTH] {
+            *px = backdrop;
+        }
+
+        let mut candidates: Vec<(u16, usize)> = Vec::new();
+        for bg in 0..2 {
+            if (dispcnt & (1 << (8 + bg))) == 0 {
+                continue;
+            }
+            let cnt = bus.read_io16(bg_cnt_addr(bg));
+            let priority = cnt & 0b11;
+            candidates.push((priority, bg));
+        }
+
+        candidates.sort_by_key(|(priority, _)| *priority);
+
+        for (_, bg) in candidates {
+            self.render_text_bg_scanline(bus, y, bg);
+        }
+    }
+
+    fn render_affine_bg_scanline(&mut self, bus: &Bus, y: usize, bg: usize) {
+        let (pa_addr, pb_addr, pc_addr, pd_addr, x_addr, y_addr) = match bg {
+            2 => (REG_BG2PA, REG_BG2PB, REG_BG2PC, REG_BG2PD, REG_BG2X, REG_BG2Y),
+            _ => (REG_BG3PA, REG_BG3PB, REG_BG3PC, REG_BG3PD, REG_BG3X, REG_BG3Y),
+        };
+
+        let bgcnt = bus.read_io16(bg_cnt_addr(bg));
+        let char_base_block = ((bgcnt >> 2) & 0x3) as usize;
+        let map_base_block = ((bgcnt >> 8) & 0x1F) as usize;
+        let wrap = (bgcnt & (1 << 13)) != 0;
+        let size = ((bgcnt >> 14) & 0x3) as usize;
+        let bg_size = match size {
+            0 => 128usize,
+            1 => 256usize,
+            2 => 512usize,
+            _ => 1024usize,
+        };
+
+        let pa = bus.read_io16(pa_addr) as i16 as i32;
+        let pb = bus.read_io16(pb_addr) as i16 as i32;
+        let pc = bus.read_io16(pc_addr) as i16 as i32;
+        let pd = bus.read_io16(pd_addr) as i16 as i32;
+        let ref_x = read_affine_ref(bus, x_addr);
+        let ref_y = read_affine_ref(bus, y_addr);
+
+        let map_base = map_base_block * 0x800;
+        let char_base = char_base_block * 0x4000;
+        let tiles_per_row = bg_size / 8;
+        let row_start = y * SCREEN_WIDTH;
+        let y_i32 = y as i32;
+        let vram = bus.vram();
+
+        let mut cur_x = ref_x + pb * y_i32;
+        let mut cur_y = ref_y + pd * y_i32;
+
+        for x in 0..SCREEN_WIDTH {
+            let src_x = cur_x >> 8;
+            let src_y = cur_y >> 8;
+
+            cur_x = cur_x.wrapping_add(pa);
+            cur_y = cur_y.wrapping_add(pc);
+
+            let (sx, sy) = if wrap {
+                (
+                    src_x.rem_euclid(bg_size as i32) as usize,
+                    src_y.rem_euclid(bg_size as i32) as usize,
+                )
+            } else {
+                if src_x < 0 || src_y < 0 || src_x >= bg_size as i32 || src_y >= bg_size as i32 {
+                    continue;
+                }
+                (src_x as usize, src_y as usize)
+            };
+
+            let tile_x = sx / 8;
+            let tile_y = sy / 8;
+            let map_index = tile_y * tiles_per_row + tile_x;
+            let tile_off = map_base + map_index;
+            let tile_id = match vram.get(tile_off) {
+                Some(v) => *v as usize,
+                None => continue,
+            };
+
+            let in_tile_x = sx & 7;
+            let in_tile_y = sy & 7;
+            let pixel_off = char_base + tile_id * 64 + in_tile_y * 8 + in_tile_x;
+            let color_index = match vram.get(pixel_off) {
+                Some(v) => *v as usize,
+                None => continue,
+            };
+
+            if color_index == 0 {
+                continue;
+            }
+
+            let color = bus.read16(PALETTE_RAM_START + (color_index * 2) as u32);
+            self.framebuffer[row_start + x] = bgr555_to_argb8888(color);
+        }
+    }
+
+    fn render_text_bg_scanline(&mut self, bus: &Bus, y: usize, bg: usize) {
+        let bgcnt = bus.read_io16(bg_cnt_addr(bg));
+        let hofs = (bus.read_io16(bg_hofs_addr(bg)) & 0x1FF) as usize;
+        let vofs = (bus.read_io16(bg_vofs_addr(bg)) & 0x1FF) as usize;
+        let char_base_block = ((bgcnt >> 2) & 0x3) as usize;
+        let map_base_block = ((bgcnt >> 8) & 0x1F) as usize;
+        let is_8bpp = (bgcnt & (1 << 7)) != 0;
+        let size = ((bgcnt >> 14) & 0x3) as usize;
+
+        let (width_tiles, height_tiles) = match size {
+            0 => (32usize, 32usize),
+            1 => (64usize, 32usize),
+            2 => (32usize, 64usize),
+            _ => (64usize, 64usize),
+        };
+
+        let map_x_base = hofs;
+        let map_y = (y + vofs) % (height_tiles * 8);
+        let tile_y = (map_y / 8) % height_tiles;
+        let in_tile_y = map_y % 8;
+
+        let row_start = y * SCREEN_WIDTH;
+        let vram = bus.vram();
+
+        for x in 0..SCREEN_WIDTH {
+            let map_x = (map_x_base + x) % (width_tiles * 8);
+            let tile_x = (map_x / 8) % width_tiles;
+            let in_tile_x = map_x % 8;
+
+            let screen_block_x = tile_x / 32;
+            let screen_block_y = tile_y / 32;
+            let screen_block_index = map_base_block + screen_block_x + screen_block_y * (width_tiles / 32);
+            let screen_base = screen_block_index * 0x800;
+            let map_index = (tile_y % 32) * 32 + (tile_x % 32);
+            let entry_off = screen_base + map_index * 2;
+
+            if entry_off + 1 >= vram.len() {
+                self.framebuffer[row_start + x] = 0xFF00_0000;
+                continue;
+            }
+
+            let entry = u16::from_le_bytes([vram[entry_off], vram[entry_off + 1]]);
+            let tile_id = (entry & 0x03FF) as usize;
+            let hflip = (entry & (1 << 10)) != 0;
+            let vflip = (entry & (1 << 11)) != 0;
+            let palette_bank = ((entry >> 12) & 0xF) as usize;
+
+            let px = if hflip { 7 - in_tile_x } else { in_tile_x };
+            let py = if vflip { 7 - in_tile_y } else { in_tile_y };
+
+            let color_index = if is_8bpp {
+                let tile_base = char_base_block * 0x4000 + tile_id * 64;
+                let off = tile_base + py * 8 + px;
+                vram.get(off).copied().unwrap_or(0)
+            } else {
+                let tile_base = char_base_block * 0x4000 + tile_id * 32;
+                let off = tile_base + py * 4 + (px / 2);
+                let byte = vram.get(off).copied().unwrap_or(0);
+                if (px & 1) == 0 {
+                    byte & 0x0F
+                } else {
+                    byte >> 4
+                }
+            } as usize;
+
+            let palette_index = if is_8bpp {
+                color_index
+            } else {
+                palette_bank * 16 + color_index
+            };
+
+            if color_index == 0 {
+                continue;
+            }
+
+            let color = bus.read16(PALETTE_RAM_START + (palette_index * 2) as u32);
+            self.framebuffer[row_start + x] = bgr555_to_argb8888(color);
+        }
+    }
+
+    fn clear_scanline(&mut self, y: usize) {
+        let row_start = y * SCREEN_WIDTH;
+        let row_end = row_start + SCREEN_WIDTH;
+        for px in &mut self.framebuffer[row_start..row_end] {
+            *px = 0xFF10_1010;
+        }
+    }
+}
+
+fn bgr555_to_argb8888(color: u16) -> u32 {
+    let b = ((color >> 10) & 0x1F) as u32;
+    let g = ((color >> 5) & 0x1F) as u32;
+    let r = (color & 0x1F) as u32;
+
+    let r8 = (r * 255) / 31;
+    let g8 = (g * 255) / 31;
+    let b8 = (b * 255) / 31;
+
+    0xFF00_0000 | (r8 << 16) | (g8 << 8) | b8
+}
+
+fn bg_cnt_addr(bg: usize) -> u32 {
+    match bg {
+        0 => REG_BG0CNT,
+        1 => REG_BG1CNT,
+        2 => REG_BG2CNT,
+        _ => REG_BG3CNT,
+    }
+}
+
+fn bg_hofs_addr(bg: usize) -> u32 {
+    match bg {
+        0 => REG_BG0HOFS,
+        1 => REG_BG1HOFS,
+        2 => REG_BG2HOFS,
+        _ => REG_BG3HOFS,
+    }
+}
+
+fn bg_vofs_addr(bg: usize) -> u32 {
+    match bg {
+        0 => REG_BG0VOFS,
+        1 => REG_BG1VOFS,
+        2 => REG_BG2VOFS,
+        _ => REG_BG3VOFS,
+    }
+}
+
+fn read_affine_ref(bus: &Bus, addr: u32) -> i32 {
+    let raw = bus.read32(addr);
+    // BGxX/BGxY are signed 28-bit fixed-point values (s19.8) in IO.
+    ((raw << 4) as i32) >> 4
+}
