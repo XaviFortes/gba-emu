@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use super::bus::{
     Bus, IRQ_VBLANK, PALETTE_RAM_START, REG_DISPCNT, REG_DISPSTAT, REG_VCOUNT,
 };
@@ -86,9 +88,15 @@ impl Ppu {
         let mut dispstat = bus.read_io16(REG_DISPSTAT);
         if state {
             dispstat |= 1;
+            if trace_bios_bus_enabled() {
+                println!("[bios-ppu] enter-vblank vcount={}", bus.read_io16(REG_VCOUNT));
+            }
             bus.request_interrupt(IRQ_VBLANK);
         } else {
             dispstat &= !1;
+            if trace_bios_bus_enabled() {
+                println!("[bios-ppu] exit-vblank vcount={}", bus.read_io16(REG_VCOUNT));
+            }
         }
         bus.write_io16(REG_DISPSTAT, dispstat);
     }
@@ -376,6 +384,15 @@ impl Ppu {
             *px = 0xFF10_1010;
         }
     }
+}
+
+fn trace_bios_bus_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| {
+        std::env::var("GBA_TRACE_BIOS_BUS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 fn bgr555_to_argb8888(color: u16) -> u32 {

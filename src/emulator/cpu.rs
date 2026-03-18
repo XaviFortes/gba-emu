@@ -257,7 +257,7 @@ impl Cpu {
             let instr = bus.read32(pc);
             if trace_bios_loop_enabled() && (0x0000_0340..0x0000_03C0).contains(&pc) {
                 println!(
-                    "[bios-loop] pc=0x{:08X} instr=0x{:08X} cpsr=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} lr=0x{:08X} if=0x{:04X} ie=0x{:04X} ime=0x{:04X}",
+                    "[bios-loop] pc=0x{:08X} instr=0x{:08X} cpsr=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r8=0x{:08X} r12=0x{:08X} lr=0x{:08X} if=0x{:04X} ie=0x{:04X} ime=0x{:04X}",
                     pc,
                     instr,
                     self.cpsr,
@@ -266,6 +266,8 @@ impl Cpu {
                     self.regs[2],
                     self.regs[3],
                     self.regs[4],
+                    self.regs[8],
+                    self.regs[12],
                     self.regs[REG_LR],
                     bus.read_io16(super::bus::REG_IF),
                     bus.read_io16(super::bus::REG_IE),
@@ -1175,21 +1177,47 @@ impl Cpu {
                 }
                 0x2 => {
                     let amount = rhs & 0xFF;
-                    let res = lhs.wrapping_shl(amount);
+                    let (res, carry) = if amount == 0 {
+                        (lhs, self.flag(CPSR_C))
+                    } else if amount < 32 {
+                        (lhs << amount, ((lhs >> (32 - amount)) & 1) != 0)
+                    } else if amount == 32 {
+                        (0, (lhs & 1) != 0)
+                    } else {
+                        (0, false)
+                    };
                     self.regs[rd] = res;
                     self.set_nz(res);
+                    self.set_flag(CPSR_C, carry);
                 }
                 0x3 => {
                     let amount = rhs & 0xFF;
-                    let res = lhs.wrapping_shr(amount);
+                    let (res, carry) = if amount == 0 {
+                        (lhs, self.flag(CPSR_C))
+                    } else if amount < 32 {
+                        (lhs >> amount, ((lhs >> (amount - 1)) & 1) != 0)
+                    } else if amount == 32 {
+                        (0, (lhs >> 31) != 0)
+                    } else {
+                        (0, false)
+                    };
                     self.regs[rd] = res;
                     self.set_nz(res);
+                    self.set_flag(CPSR_C, carry);
                 }
                 0x4 => {
                     let amount = rhs & 0xFF;
-                    let res = ((lhs as i32) >> amount) as u32;
+                    let (res, carry) = if amount == 0 {
+                        (lhs, self.flag(CPSR_C))
+                    } else if amount < 32 {
+                        (((lhs as i32) >> amount) as u32, ((lhs >> (amount - 1)) & 1) != 0)
+                    } else {
+                        let sign = (lhs >> 31) != 0;
+                        (if sign { 0xFFFF_FFFF } else { 0 }, sign)
+                    };
                     self.regs[rd] = res;
                     self.set_nz(res);
+                    self.set_flag(CPSR_C, carry);
                 }
                 0x5 => {
                     let carry_in = if self.flag(CPSR_C) { 1 } else { 0 };
@@ -1215,9 +1243,20 @@ impl Cpu {
                 }
                 0x7 => {
                     let amount = rhs & 0xFF;
-                    let res = lhs.rotate_right(amount & 31);
+                    let (res, carry) = if amount == 0 {
+                        (lhs, self.flag(CPSR_C))
+                    } else {
+                        let rot = amount & 31;
+                        if rot == 0 {
+                            (lhs, (lhs >> 31) != 0)
+                        } else {
+                            let value = lhs.rotate_right(rot);
+                            (value, (value >> 31) != 0)
+                        }
+                    };
                     self.regs[rd] = res;
                     self.set_nz(res);
+                    self.set_flag(CPSR_C, carry);
                 }
                 0x8 => {
                     let res = lhs & rhs;
@@ -1500,6 +1539,17 @@ impl Cpu {
         // Conditional branch.
         if (instr & 0xF000) == 0xD000 && (instr & 0x0F00) != 0x0F00 {
             let cond = ((instr >> 8) & 0xF) as u8;
+            let curr_pc = self.pc().wrapping_sub(2);
+            if trace_bios_loop_enabled() && curr_pc == 0x0000_1C66 {
+                println!(
+                    "[bios-1c66] r7=0x{:08X} cpsr=0x{:08X} cond=0x{:X} taken={} instr=0x{:04X}",
+                    self.regs[7],
+                    self.cpsr,
+                    cond,
+                    self.condition_passed(cond),
+                    instr
+                );
+            }
             if self.condition_passed(cond) {
                 let imm8 = (instr & 0xFF) as i8;
                 let signed = ((imm8 as i16) << 1) as i32;

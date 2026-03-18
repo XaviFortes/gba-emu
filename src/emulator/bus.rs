@@ -26,6 +26,9 @@ pub const OAM_START: u32 = 0x0700_0000;
 pub const OAM_SIZE: usize = 1024;
 
 pub const GAMEPAK_ROM_START: u32 = 0x0800_0000;
+const GAMEPAK_ROM_END: u32 = 0x0E00_0000;
+const GAMEPAK_SRAM_START: u32 = 0x0E00_0000;
+const GAMEPAK_SRAM_END: u32 = 0x0E01_0000;
 
 pub const REG_DISPCNT: u32 = IO_START + 0x000;
 pub const REG_DISPSTAT: u32 = IO_START + 0x004;
@@ -159,12 +162,17 @@ impl Bus {
             return self.oam[(addr - OAM_START) as usize];
         }
 
-        if addr >= GAMEPAK_ROM_START {
+        if (GAMEPAK_ROM_START..GAMEPAK_ROM_END).contains(&addr) {
             if self.rom.is_empty() {
                 return 0xFF;
             }
             let offset = ((addr - GAMEPAK_ROM_START) as usize) % self.rom.len();
             return self.rom[offset];
+        }
+
+        if (GAMEPAK_SRAM_START..GAMEPAK_SRAM_END).contains(&addr) {
+            // Backup memory is unimplemented for now; open-bus style fallback.
+            return 0xFF;
         }
 
         0
@@ -360,8 +368,24 @@ impl Bus {
     }
 
     pub fn request_interrupt(&mut self, irq_mask: u16) {
+        if trace_bios_bus_enabled() {
+            println!(
+                "[bios-bus] request_interrupt mask=0x{:04X} ie=0x{:04X} if_before=0x{:04X}",
+                irq_mask,
+                self.read_io16_raw(REG_IE),
+                self.read_io16_raw(REG_IF)
+            );
+        }
+
         let pending = self.read_io16_raw(REG_IF) | irq_mask;
         self.write_io16_raw(REG_IF, pending);
+
+        if trace_bios_bus_enabled() {
+            println!(
+                "[bios-bus] request_interrupt if_after=0x{:04X}",
+                self.read_io16_raw(REG_IF)
+            );
+        }
 
         if !self.bios_loaded {
             // No-BIOS compatibility: many commercial games rely on a RAM IRQ-check
