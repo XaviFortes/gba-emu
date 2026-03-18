@@ -33,8 +33,11 @@ pub struct DebugSnapshot {
     pub ie: u16,
     pub iflags: u16,
     pub handoff_7ff0: u8,
+    pub bios_irq_flags: u16,
     pub irq_vec: u32,
     pub irq_check: u16,
+    pub frame_bios_steps: u32,
+    pub frame_rom_steps: u32,
 }
 
 #[derive(Debug)]
@@ -45,6 +48,8 @@ pub struct Gba {
     apu: apu::Apu,
     input: input::Input,
     timers: timers::Timers,
+    last_frame_bios_steps: u32,
+    last_frame_rom_steps: u32,
 }
 
 impl Gba {
@@ -56,15 +61,15 @@ impl Gba {
             apu: apu::Apu::new(),
             input: input::Input::new(),
             timers: timers::Timers::new(),
+            last_frame_bios_steps: 0,
+            last_frame_rom_steps: 0,
         }
     }
 
     pub fn reset(&mut self) {
         self.cpu.reset();
         if self.bus.has_bios() {
-            self.cpu.set_pc(0x0000_0000);
-            // BIOS IRQ dispatcher reads handler pointer from 0x03FFFFFC.
-            self.bus.write32(0x03FF_FFFC, 0x0800_0000);
+            self.cpu.force_boot_to_bios();
         } else {
             self.cpu.force_boot_to_rom();
         }
@@ -88,8 +93,18 @@ impl Gba {
 
     fn run_frame_internal(&mut self, render_video: bool) {
         let mut cycles = 0;
+        let mut frame_bios_steps = 0u32;
+        let mut frame_rom_steps = 0u32;
         while cycles < CYCLES_PER_FRAME {
             let spent = self.cpu.step(&mut self.bus);
+
+            let pc = self.cpu.pc();
+            if pc < 0x0000_4000 {
+                frame_bios_steps = frame_bios_steps.saturating_add(1);
+            } else if (0x0800_0000..0x0E00_0000).contains(&pc) {
+                frame_rom_steps = frame_rom_steps.saturating_add(1);
+            }
+
             self.timers.tick(&mut self.bus, spent);
             self.ppu.tick(spent, &mut self.bus, render_video);
             self.input.tick(&mut self.bus);
@@ -113,6 +128,9 @@ impl Gba {
             self.apu.tick(&self.bus);
             cycles += spent;
         }
+
+        self.last_frame_bios_steps = frame_bios_steps;
+        self.last_frame_rom_steps = frame_rom_steps;
     }
 
     pub fn set_input_held_mask(&mut self, held_mask: u16) {
@@ -146,13 +164,21 @@ impl Gba {
             ie: self.bus.read_io16(bus::REG_IE),
             iflags: self.bus.read_io16(bus::REG_IF),
             handoff_7ff0: self.bus.read8(0x0300_7FF0),
+            bios_irq_flags: self.bus.read16(0x03FF_FFF8),
             irq_vec: self.bus.read32(0x03FF_FFFC),
             irq_check: self.bus.read16(0x0300_22DC),
+            frame_bios_steps: self.last_frame_bios_steps,
+            frame_rom_steps: self.last_frame_rom_steps,
         }
     }
 
     pub fn set_trace_branches(&mut self, enabled: bool) {
         cpu::Cpu::set_trace_branches(enabled);
+    }
+
+    pub fn force_boot_to_rom_without_bios(&mut self) {
+        self.bus.disable_bios();
+        self.cpu.force_boot_to_rom();
     }
 }
 

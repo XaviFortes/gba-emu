@@ -17,6 +17,7 @@ const CPSR_C: u32 = 1 << 29;
 const CPSR_V: u32 = 1 << 28;
 const CPSR_THUMB: u32 = 1 << 5;
 const CPSR_IRQ_DISABLE: u32 = 1 << 7;
+const CPSR_FIQ_DISABLE: u32 = 1 << 6;
 const BIOSLESS_IRQ_RETURN_MAGIC: u32 = 0xFFFF_FFE0;
 
 #[allow(dead_code)]
@@ -178,8 +179,26 @@ impl Cpu {
     }
 
     pub fn force_boot_to_rom(&mut self) {
-        self.cpsr &= !CPSR_THUMB;
+        // Use a clean post-reset CPU state when forcing ROM boot (eg. BIOS watchdog),
+        // otherwise random in-flight BIOS register state can branch into garbage.
+        let saved_cycles = self.cycles;
+        self.reset();
+        self.cycles = saved_cycles;
+
+        self.cpsr = 0x0000_001F;
+        self.mode = CpuMode::System;
+        self.regs[0] = GAMEPAK_ROM_START;
+        self.regs[1] = 0;
+        self.regs[2] = 0;
+        self.regs[REG_SP] = 0x0300_7F00;
         self.set_pc(GAMEPAK_ROM_START);
+    }
+
+    pub fn force_boot_to_bios(&mut self) {
+        // Hardware reset enters ARM Supervisor mode with IRQ/FIQ disabled.
+        self.switch_mode(CpuMode::Supervisor);
+        self.cpsr = 0x0000_00D3;
+        self.set_pc(0x0000_0000);
     }
 
     pub fn set_trace_branches(enabled: bool) {
@@ -187,6 +206,10 @@ impl Cpu {
     }
 
     pub fn step(&mut self, bus: &mut Bus) -> u32 {
+        if bus.take_halt_request() {
+            self.halted = true;
+        }
+
         if self.halted {
             if !bus.has_bios() && bus.has_pending_interrupts() {
                 // No BIOS path: SWI IntrWait/Halt should still resume when IF/IE/IME match,
@@ -232,6 +255,23 @@ impl Cpu {
             spent
         } else {
             let instr = bus.read32(pc);
+            if trace_bios_loop_enabled() && (0x0000_0340..0x0000_03C0).contains(&pc) {
+                println!(
+                    "[bios-loop] pc=0x{:08X} instr=0x{:08X} cpsr=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} lr=0x{:08X} if=0x{:04X} ie=0x{:04X} ime=0x{:04X}",
+                    pc,
+                    instr,
+                    self.cpsr,
+                    self.regs[0],
+                    self.regs[1],
+                    self.regs[2],
+                    self.regs[3],
+                    self.regs[4],
+                    self.regs[REG_LR],
+                    bus.read_io16(super::bus::REG_IF),
+                    bus.read_io16(super::bus::REG_IE),
+                    bus.read_io16(super::bus::REG_IME)
+                );
+            }
             self.set_pc(pc.wrapping_add(4));
             let spent = self.exec_arm(bus, instr);
             if TRACE_BRANCHES.load(Ordering::Relaxed) && self.pc() != expected_next {
@@ -262,21 +302,45 @@ impl Cpu {
             return false;
         }
 
-        let Some(_mask) = bus.claim_pending_interrupt() else {
+        let Some(mask) = bus.claim_pending_interrupt() else {
             return false;
         };
+
+        if trace_bios_irq_enabled() {
+            println!(
+                "[bios-irq] claim pc=0x{:08X} cpsr=0x{:08X} mask=0x{:04X} ime=0x{:04X} ie=0x{:04X} if=0x{:04X}",
+                self.pc(),
+                self.cpsr,
+                mask,
+                bus.read_io16(super::bus::REG_IME),
+                bus.read_io16(super::bus::REG_IE),
+                bus.read_io16(super::bus::REG_IF)
+            );
+        }
+
+        // BIOS IRQ wait routines (e.g. IntrWait/VBlankIntrWait) consume pending bits
+        // from 0x03FFFFF8. Mirror claimed IRQs here to avoid losing wake events.
+        let bios_flags = bus.read16(0x03FF_FFF8) | mask;
+        bus.write16(0x03FF_FFF8, bios_flags);
 
         self.spsr_irq = self.cpsr;
         self.switch_mode(CpuMode::Irq);
 
-        self.regs[REG_LR] = if self.is_thumb() {
-            self.pc().wrapping_add(2)
-        } else {
-            self.pc().wrapping_add(4)
-        };
+        // ARM7TDMI exception return sequence (SUBS PC, LR, #4) expects LR_irq to be
+        // return_address + 4 for both ARM and Thumb origins.
+        self.regs[REG_LR] = self.pc().wrapping_add(4);
 
         self.cpsr &= !CPSR_THUMB;
-        self.cpsr |= CPSR_IRQ_DISABLE;
+        self.cpsr |= CPSR_IRQ_DISABLE | CPSR_FIQ_DISABLE;
+
+        if trace_bios_irq_enabled() {
+            println!(
+                "[bios-irq] enter pc=0x{:08X} lr_irq=0x{:08X} spsr_irq=0x{:08X}",
+                0x0000_0018u32,
+                self.regs[REG_LR],
+                self.spsr_irq
+            );
+        }
 
         if bus.has_bios() {
             // Standard ARM IRQ vector entry via BIOS.
@@ -448,9 +512,6 @@ impl Cpu {
         // SWI
         if (instr & 0x0F00_0000) == 0x0F00_0000 {
             let swi = (instr & 0x00FF_FFFF) as u8;
-            if swi == 0x04 || swi == 0x05 {
-                return self.hle_swi(bus, swi);
-            }
             if bus.has_bios() {
                 self.software_interrupt(false);
                 return 3;
@@ -612,6 +673,23 @@ impl Cpu {
                 (true, true) => (bus.read16(addr & !1) as i16) as i32 as u32,
                 _ => self.regs[rd],
             };
+            if trace_halfword_enabled() && (self.pc().wrapping_sub(4) == 0x0000_0360) {
+                println!(
+                    "[halfword] pc=0x{:08X} instr=0x{:08X} addr=0x{:08X} load=0x{:08X} rn={} rd={} imm={} pre={} up={} wb={} s={} h={}",
+                    self.pc().wrapping_sub(4),
+                    instr,
+                    addr & !1,
+                    value,
+                    rn,
+                    rd,
+                    immediate,
+                    pre,
+                    up,
+                    writeback,
+                    s,
+                    h
+                );
+            }
             self.regs[rd] = value;
         } else if !s && h {
             // Guardar Halfword (STRH)
@@ -2147,6 +2225,33 @@ fn trace_msr_enabled() -> bool {
     static TRACE: OnceLock<bool> = OnceLock::new();
     *TRACE.get_or_init(|| {
         std::env::var("GBA_TRACE_MSR")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn trace_bios_irq_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| {
+        std::env::var("GBA_TRACE_BIOS_IRQ")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn trace_bios_loop_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| {
+        std::env::var("GBA_TRACE_BIOS_LOOP")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn trace_halfword_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| {
+        std::env::var("GBA_TRACE_HALFW")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })

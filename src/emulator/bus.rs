@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 
 pub const BIOS_START: u32 = 0x0000_0000;
 pub const BIOS_SIZE: usize = 16 * 1024;
@@ -33,6 +34,7 @@ pub const REG_KEYINPUT: u32 = IO_START + 0x130;
 pub const REG_IE: u32 = IO_START + 0x200;
 pub const REG_IF: u32 = IO_START + 0x202;
 pub const REG_IME: u32 = IO_START + 0x208;
+const REG_HALTCNT: u32 = IO_START + 0x301;
 
 pub const IRQ_VBLANK: u16 = 1 << 0;
 #[allow(dead_code)]
@@ -73,6 +75,7 @@ pub struct Bus {
     oam: [u8; OAM_SIZE],
     rom: Vec<u8>,
     timers: [TimerState; 4],
+    halt_requested: bool,
 }
 
 impl Bus {
@@ -94,6 +97,7 @@ impl Bus {
                 };
                 4
             ],
+            halt_requested: false,
         };
         bus.write_io16_raw(REG_KEYINPUT, 0x03FF);
         bus
@@ -109,6 +113,10 @@ impl Bus {
 
     pub fn has_bios(&self) -> bool {
         self.bios_loaded
+    }
+
+    pub fn disable_bios(&mut self) {
+        self.bios_loaded = false;
     }
 
     pub fn load_rom<P: AsRef<Path>>(&mut self, path: P) -> Result<(), std::io::Error> {
@@ -177,6 +185,19 @@ impl Bus {
     }
 
     pub fn write8(&mut self, addr: u32, value: u8) {
+        if trace_bios_bus_enabled()
+            && (addr == REG_IME
+                || addr == REG_IE
+                || addr == REG_IE + 1
+                || addr == REG_IF
+                || addr == REG_IF + 1
+                || addr == REG_HALTCNT
+                || addr == 0x03FF_FFF8
+                || addr == 0x03FF_FFF9)
+        {
+            println!("[bios-bus] write8 addr=0x{:08X} value=0x{:02X}", addr, value);
+        }
+
         if (EWRAM_START..EWRAM_START + EWRAM_REGION_SIZE).contains(&addr) {
             let off = ((addr - EWRAM_START) as usize) % EWRAM_SIZE;
             self.ewram[off] = value;
@@ -190,6 +211,14 @@ impl Bus {
         }
 
         if (IO_START..IO_START + IO_SIZE as u32).contains(&addr) {
+            if addr == REG_HALTCNT {
+                // HALTCNT bit7=0 enters HALT (STOP is bit7=1 and remains unimplemented).
+                if (value & 0x80) == 0 {
+                    self.halt_requested = true;
+                }
+                return;
+            }
+
             if addr == REG_IF || addr == REG_IF + 1 {
                 let current = self.read_io16_raw(REG_IF);
                 let clear_mask = if addr == REG_IF {
@@ -233,6 +262,15 @@ impl Bus {
     }
 
     pub fn write16(&mut self, addr: u32, value: u16) {
+        if trace_bios_bus_enabled()
+            && (addr == REG_IME
+                || addr == REG_IE
+                || addr == REG_IF
+                || addr == 0x03FF_FFF8)
+        {
+            println!("[bios-bus] write16 addr=0x{:08X} value=0x{:04X}", addr, value);
+        }
+
         if addr == REG_VCOUNT || addr == REG_KEYINPUT {
             return;
         }
@@ -352,6 +390,12 @@ impl Bus {
 
         let mask = 1u16 << pending.trailing_zeros();
         Some(mask)
+    }
+
+    pub fn take_halt_request(&mut self) -> bool {
+        let requested = self.halt_requested;
+        self.halt_requested = false;
+        requested
     }
 
     pub fn tick_timers(&mut self, cycles: u32) {
@@ -496,6 +540,15 @@ fn update_dma_addr(addr: u32, control: u16, amount: u32) -> u32 {
         3 => addr.wrapping_add(amount),
         _ => addr,
     }
+}
+
+fn trace_bios_bus_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| {
+        std::env::var("GBA_TRACE_BIOS_BUS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 impl Default for Bus {

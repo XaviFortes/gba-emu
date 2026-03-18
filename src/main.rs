@@ -36,7 +36,7 @@ fn is_probably_executable(pc: u32) -> bool {
 
 fn log_snapshot(prefix: &str, frame: u32, snap: DebugSnapshot) {
     println!(
-        "[{prefix}] frame={frame} pc=0x{:08X} cpsr=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r7=0x{:08X} sp=0x{:08X} lr=0x{:08X} cycles={} dispcnt=0x{:04X} vcount={} ime=0x{:04X} ie=0x{:04X} if=0x{:04X} handoff=0x{:02X} irq_vec=0x{:08X} irq_check=0x{:04X}",
+        "[{prefix}] frame={frame} pc=0x{:08X} cpsr=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r7=0x{:08X} sp=0x{:08X} lr=0x{:08X} cycles={} dispcnt=0x{:04X} vcount={} ime=0x{:04X} ie=0x{:04X} if=0x{:04X} handoff=0x{:02X} bios_irq_flags=0x{:04X} irq_vec=0x{:08X} irq_check=0x{:04X} bios_steps={} rom_steps={}",
         snap.pc,
         snap.cpsr,
         snap.r0,
@@ -54,8 +54,11 @@ fn log_snapshot(prefix: &str, frame: u32, snap: DebugSnapshot) {
         snap.ie,
         snap.iflags,
         snap.handoff_7ff0,
+        snap.bios_irq_flags,
         snap.irq_vec,
-        snap.irq_check
+        snap.irq_check,
+        snap.frame_bios_steps,
+        snap.frame_rom_steps
     );
 }
 
@@ -177,9 +180,9 @@ fn run_windowed(gba: &mut Gba, debug: DebugOptions) -> Result<(), String> {
         if let Some(limit) = debug.bios_watchdog_frames {
             if limit != 0 && bios_frames == limit {
                 println!(
-                    "[window] bios-watchdog triggered at frame={frame}; forcing jump to ROM start"
+                    "[window] bios-watchdog triggered at frame={frame}; switching to no-BIOS ROM boot"
                 );
-                gba.cpu.force_boot_to_rom();
+                gba.force_boot_to_rom_without_bios();
             }
         }
 
@@ -341,9 +344,9 @@ fn main() -> ExitCode {
             if let Some(limit) = debug.bios_watchdog_frames {
                 if limit != 0 && bios_frames == limit {
                     println!(
-                        "[headless] bios-watchdog triggered at frame={frame}; forcing jump to ROM start"
+                        "[headless] bios-watchdog triggered at frame={frame}; switching to no-BIOS ROM boot"
                     );
-                    gba.cpu.force_boot_to_rom();
+                    gba.force_boot_to_rom_without_bios();
                 }
             }
         }
