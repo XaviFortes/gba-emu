@@ -217,26 +217,29 @@ impl Cpu {
         }
 
         // MRS Rd, CPSR
-        if (instr & 0x0FBF_0FFF) == 0x010F_0000 {
+        // (instr & 0x90) != 0x90 evita que se trague los SWP, MUL, etc.
+        if (instr & 0x0FB0_0000) == 0x0100_0000 && (instr & 0x0000_0090) != 0x0000_0090 {
             let rd = ((instr >> 12) & 0xF) as usize;
-            self.regs[rd] = self.cpsr;
-            return 1;
-        }
+            let use_spsr = (instr & (1 << 22)) != 0;
 
-        // MRS Rd, SPSR
-        if (instr & 0x0FBF_0FFF) == 0x014F_0000 {
-            let rd = ((instr >> 12) & 0xF) as usize;
-            self.regs[rd] = self.current_spsr();
+            self.regs[rd] = if use_spsr {
+                self.current_spsr()
+            } else {
+                self.cpsr
+            };
             return 1;
         }
 
         // MSR CPSR/SPSR fields, Rm
         // Explicit bitfield decode avoids false positives while accepting non-canonical Rd encodings.
+        // MSR CPSR/SPSR fields, Rm
         let msr_op = (instr >> 23) & 0x1F;
         let msr_bits_21_20 = (instr >> 20) & 0x3;
-        let msr_low_11_4 = (instr >> 4) & 0xFF;
-        let msr_rd_bits = ((instr >> 12) & 0xF) as u8;
-        if msr_op == 0b00010 && msr_bits_21_20 == 0b10 && msr_low_11_4 == 0 && msr_rd_bits == 0xF {
+            
+        if msr_op == 0b00010 && msr_bits_21_20 == 0b10 
+            && (instr & 0x0000_0090) != 0x0000_0090 
+            && (instr & 0x0FFFFFF0) != 0x012FFF10 // Evita que se trague el BX
+        {
             let rm = (instr & 0xF) as usize;
             let field_mask = ((instr >> 16) & 0xF) as u8;
             let value = self.regs[rm];
@@ -250,8 +253,7 @@ impl Cpu {
         }
 
         // MSR CPSR/SPSR fields, #immediate
-        let msr_imm_rd_bits = ((instr >> 12) & 0xF) as u8;
-        if msr_op == 0b00110 && msr_bits_21_20 == 0b10 && msr_imm_rd_bits == 0xF {
+        if msr_op == 0b00110 && msr_bits_21_20 == 0b10 {
             let imm8 = instr & 0xFF;
             let rot = ((instr >> 8) & 0xF) * 2;
             let value = imm8.rotate_right(rot);
