@@ -34,6 +34,7 @@ pub struct DebugSnapshot {
     pub iflags: u16,
     pub handoff_7ff0: u8,
     pub irq_vec: u32,
+    pub irq_check: u16,
 }
 
 #[derive(Debug)]
@@ -92,6 +93,15 @@ impl Gba {
             self.timers.tick(&mut self.bus, spent);
             self.ppu.tick(spent, &mut self.bus, render_video);
             self.input.tick(&mut self.bus);
+
+            if !self.bus.has_bios() {
+                let iflags = self.bus.read_io16(bus::REG_IF);
+                if iflags != 0 {
+                    let irq_check = self.bus.read16(0x0300_22DC) | iflags;
+                    self.bus.write16(0x0300_22DC, irq_check);
+                }
+            }
+
             self.apu.tick(&self.bus);
             cycles += spent;
         }
@@ -129,6 +139,7 @@ impl Gba {
             iflags: self.bus.read_io16(bus::REG_IF),
             handoff_7ff0: self.bus.read8(0x0300_7FF0),
             irq_vec: self.bus.read32(0x03FF_FFFC),
+            irq_check: self.bus.read16(0x0300_22DC),
         }
     }
 

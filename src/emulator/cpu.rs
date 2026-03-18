@@ -17,6 +17,7 @@ const CPSR_C: u32 = 1 << 29;
 const CPSR_V: u32 = 1 << 28;
 const CPSR_THUMB: u32 = 1 << 5;
 const CPSR_IRQ_DISABLE: u32 = 1 << 7;
+const BIOSLESS_IRQ_RETURN_MAGIC: u32 = 0xFFFF_FFE0;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,9 @@ pub struct Cpu {
     banked_r12_sys: u32,
     banked_sp_sys: u32,
     banked_lr_sys: u32,
+    biosless_irq_active: bool,
+    biosless_irq_saved: [u32; 5],
+    biosless_irq_lr: u32,
     pub halted: bool,
     pub cycles: u64,
 }
@@ -99,6 +103,9 @@ impl Cpu {
             banked_r12_sys: 0,
             banked_sp_sys: 0x0300_7F00,
             banked_lr_sys: 0,
+            biosless_irq_active: false,
+            biosless_irq_saved: [0; 5],
+            biosless_irq_lr: 0,
             halted: false,
             cycles: 0,
         };
@@ -139,6 +146,9 @@ impl Cpu {
         self.banked_r12_sys = self.regs[12];
         self.banked_sp_sys = self.regs[REG_SP];
         self.banked_lr_sys = self.regs[REG_LR];
+        self.biosless_irq_active = false;
+        self.biosless_irq_saved = [0; 5];
+        self.biosless_irq_lr = 0;
         self.halted = false;
         self.cycles = 0;
     }
@@ -178,6 +188,14 @@ impl Cpu {
 
     pub fn step(&mut self, bus: &mut Bus) -> u32 {
         if self.halted {
+            if !bus.has_bios() && bus.has_pending_interrupts() {
+                // No BIOS path: SWI IntrWait/Halt should still resume when IF/IE/IME match,
+                // even if we are not entering the BIOS IRQ exception vector.
+                self.halted = false;
+                self.cycles += 1;
+                return 1;
+            }
+
             if self.handle_irq(bus) {
                 self.halted = false;
                 self.cycles += 7;
@@ -232,6 +250,10 @@ impl Cpu {
     }
 
     fn handle_irq(&mut self, bus: &mut Bus) -> bool {
+        if !bus.has_bios() {
+            return false;
+        }
+
         if (self.cpsr & CPSR_IRQ_DISABLE) != 0 {
             return false;
         }
@@ -256,7 +278,34 @@ impl Cpu {
         self.cpsr &= !CPSR_THUMB;
         self.cpsr |= CPSR_IRQ_DISABLE;
 
-        self.set_pc(0x0000_0018);
+        if bus.has_bios() {
+            // Standard ARM IRQ vector entry via BIOS.
+            self.set_pc(0x0000_0018);
+        } else {
+            // BIOS-less mode: emulate BIOS IRQ dispatcher callback.
+            let handler = bus.read32(0x03FF_FFFC);
+            if handler == 0 {
+                self.set_pc(0x0000_0018);
+                return true;
+            }
+
+            self.biosless_irq_active = true;
+            self.biosless_irq_saved[0] = self.regs[0];
+            self.biosless_irq_saved[1] = self.regs[1];
+            self.biosless_irq_saved[2] = self.regs[2];
+            self.biosless_irq_saved[3] = self.regs[3];
+            self.biosless_irq_saved[4] = self.regs[12];
+            self.biosless_irq_lr = self.regs[REG_LR];
+
+            self.regs[REG_LR] = BIOSLESS_IRQ_RETURN_MAGIC;
+            if (handler & 1) != 0 {
+                self.cpsr |= CPSR_THUMB;
+                self.set_pc(handler & !1);
+            } else {
+                self.cpsr &= !CPSR_THUMB;
+                self.set_pc(handler & !3);
+            }
+        }
 
         true
     }
@@ -1570,6 +1619,26 @@ impl Cpu {
     }
 
     fn branch_exchange(&mut self, target: u32) {
+        if self.biosless_irq_active && (target & !1) == BIOSLESS_IRQ_RETURN_MAGIC {
+            let return_pc = self.biosless_irq_lr.wrapping_sub(4);
+            self.biosless_irq_active = false;
+
+            self.regs[0] = self.biosless_irq_saved[0];
+            self.regs[1] = self.biosless_irq_saved[1];
+            self.regs[2] = self.biosless_irq_saved[2];
+            self.regs[3] = self.biosless_irq_saved[3];
+            self.regs[12] = self.biosless_irq_saved[4];
+            self.regs[REG_LR] = self.biosless_irq_lr;
+
+            self.restore_cpsr_from_spsr();
+            if self.is_thumb() {
+                self.set_pc(return_pc & !1);
+            } else {
+                self.set_pc(return_pc & !3);
+            }
+            return;
+        }
+
         // Real BIOS eventually hands control to cartridge code; if execution is in BIOS
         // and BX resolves to 0, treat that as boot handoff to ROM entry.
         if target == 0 && self.pc() < BIOS_SIZE as u32 {

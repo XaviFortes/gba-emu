@@ -324,6 +324,15 @@ impl Bus {
     pub fn request_interrupt(&mut self, irq_mask: u16) {
         let pending = self.read_io16_raw(REG_IF) | irq_mask;
         self.write_io16_raw(REG_IF, pending);
+
+        if !self.bios_loaded {
+            // No-BIOS compatibility: many commercial games rely on a RAM IRQ-check
+            // halfword normally maintained by their installed IRQ callback.
+            // Mirror pending IRQ bits into that location so wait loops can progress.
+            let mut irq_check = self.read16(0x0300_22DC);
+            irq_check |= irq_mask;
+            self.write16(0x0300_22DC, irq_check);
+        }
     }
 
     pub fn has_pending_interrupts(&self) -> bool {
