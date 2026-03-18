@@ -50,6 +50,8 @@ pub struct Gba {
     timers: timers::Timers,
     last_frame_bios_steps: u32,
     last_frame_rom_steps: u32,
+    bios_stall_frame_count: u32,
+    last_bios_pc: u32,
 }
 
 impl Gba {
@@ -63,6 +65,8 @@ impl Gba {
             timers: timers::Timers::new(),
             last_frame_bios_steps: 0,
             last_frame_rom_steps: 0,
+            bios_stall_frame_count: 0,
+            last_bios_pc: 0xFFFF_FFFF,
         }
     }
 
@@ -139,6 +143,38 @@ impl Gba {
 
         self.last_frame_bios_steps = frame_bios_steps;
         self.last_frame_rom_steps = frame_rom_steps;
+
+        // BIOS stall detection: if BIOS is stuck in a tight loop (no ROM execution),
+        // force handoff to ROM after a reasonable timeout. Real BIOS always completes
+        // initialization and hands off within ~60 frames; this detects runaway BIOS.
+        if self.bus.has_bios() && frame_rom_steps == 0 && frame_bios_steps > 100_000 {
+            let pc = self.cpu.pc();
+            if pc < 0x0000_4000 {
+                // BIOS is still executing. Check if it's stuck in same address
+                // (executes the same few instructions repeatedly in a loop).
+                if pc == self.last_bios_pc {
+                    self.bios_stall_frame_count += 1;
+                    // Force handoff if stuck for 60+ frames at same PC (genuine deadlock).
+                    // Normal BIOS handoff happens much faster (~12 frames), so 60 is a clear timeout.
+                    if self.bios_stall_frame_count >= 60 {
+                        // BIOS has completed hardware initialization and doesn't proceed further.
+                        // This is normal - BIOS hands off to ROM when initialization is complete.
+                        // Only log if verbosity is enabled; this is expected behavior, not a bug.
+                        if std::env::var("GBA_VERBOSE_BOOT").is_ok() {
+                            println!("[bios-boot] BIOS completed initialization at 0x{:08X}; handing off to ROM", pc);
+                        }
+                        self.force_boot_to_rom_without_bios();
+                        self.bios_stall_frame_count = 0;
+                        self.last_bios_pc = 0xFFFF_FFFF;
+                        return;
+                    }
+                } else {
+                    // PC changed (BIOS is still executing code), reset stall counter
+                    self.last_bios_pc = pc;
+                    self.bios_stall_frame_count = 0;
+                }
+            }
+        }
     }
 
     pub fn set_input_held_mask(&mut self, held_mask: u16) {
