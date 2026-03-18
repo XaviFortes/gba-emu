@@ -95,10 +95,18 @@ impl Gba {
             self.input.tick(&mut self.bus);
 
             if !self.bus.has_bios() {
+                // Emerald no-BIOS compatibility: keep callback-polled IRQ-ready bytes set
+                // so startup gate loops do not deadlock waiting on BIOS-maintained state.
+                self.bus.write8(0x0300_34A9, 1);
+                self.bus.write8(0x0300_6A0C, 1);
+
                 let iflags = self.bus.read_io16(bus::REG_IF);
                 if iflags != 0 {
                     let irq_check = self.bus.read16(0x0300_22DC) | iflags;
                     self.bus.write16(0x0300_22DC, irq_check);
+
+                    // BIOS-less IRQ compatibility: acknowledge handled IRQ bits.
+                    self.bus.write_io16(bus::REG_IF, iflags);
                 }
             }
 
