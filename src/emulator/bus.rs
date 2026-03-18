@@ -38,6 +38,11 @@ pub const REG_IE: u32 = IO_START + 0x200;
 pub const REG_IF: u32 = IO_START + 0x202;
 pub const REG_IME: u32 = IO_START + 0x208;
 const REG_HALTCNT: u32 = IO_START + 0x301;
+const REG_JOY_RECV: u32 = IO_START + 0x150;
+const REG_JOY_TRANS: u32 = IO_START + 0x154;
+const REG_JOYSTAT: u32 = IO_START + 0x158;
+const BIOS_HELPER_STATE_START: u32 = 0x0300_000C;
+const BIOS_HELPER_STATE_END: u32 = 0x0300_001F;
 
 pub const IRQ_VBLANK: u16 = 1 << 0;
 #[allow(dead_code)]
@@ -102,7 +107,13 @@ impl Bus {
             ],
             halt_requested: false,
         };
-        bus.write_io16_raw(REG_KEYINPUT, 0x03FF);
+        bus.write_io16_raw(REG_KEYINPUT, 0xFFFF);
+        // Joybus idle state (no host attached) prevents BIOS link polling deadlocks.
+        bus.write_io16_raw(REG_JOY_RECV, 0xFFFF);
+        bus.write_io16_raw(REG_JOY_RECV + 2, 0xFFFF);
+        bus.write_io16_raw(REG_JOY_TRANS, 0xFFFF);
+        bus.write_io16_raw(REG_JOY_TRANS + 2, 0xFFFF);
+        bus.write_io16_raw(REG_JOYSTAT, 0x0000);
         bus
     }
 
@@ -143,11 +154,20 @@ impl Bus {
 
         if (IWRAM_START..IWRAM_START + IWRAM_REGION_SIZE).contains(&addr) {
             let off = ((addr - IWRAM_START) as usize) % IWRAM_SIZE;
-            return self.iwram[off];
+            let value = self.iwram[off];
+            if trace_bios_bus_enabled() && (BIOS_HELPER_STATE_START..=BIOS_HELPER_STATE_END).contains(&addr)
+            {
+                println!("[bios-iw] read8 addr=0x{:08X} value=0x{:02X}", addr, value);
+            }
+            return value;
         }
 
         if (IO_START..IO_START + IO_SIZE as u32).contains(&addr) {
-            return self.io[(addr - IO_START) as usize];
+            let value = self.io[(addr - IO_START) as usize];
+            if trace_bios_bus_enabled() && (0x0400_0120..=0x0400_0159).contains(&addr) {
+                println!("[bios-bus] read8 addr=0x{:08X} value=0x{:02X}", addr, value);
+            }
+            return value;
         }
 
         if (PALETTE_RAM_START..PALETTE_RAM_START + PALETTE_RAM_SIZE as u32).contains(&addr) {
@@ -193,6 +213,12 @@ impl Bus {
     }
 
     pub fn write8(&mut self, addr: u32, value: u8) {
+        let iwram_off = if (IWRAM_START..IWRAM_START + IWRAM_REGION_SIZE).contains(&addr) {
+            Some((addr - IWRAM_START) % IWRAM_SIZE as u32)
+        } else {
+            None
+        };
+
         if trace_bios_bus_enabled()
             && (addr == REG_IME
                 || addr == REG_IE
@@ -200,8 +226,10 @@ impl Bus {
                 || addr == REG_IF
                 || addr == REG_IF + 1
                 || addr == REG_HALTCNT
+                || (0x0400_0120..=0x0400_0159).contains(&addr)
                 || addr == 0x03FF_FFF8
-                || addr == 0x03FF_FFF9)
+                || addr == 0x03FF_FFF9
+                || matches!(iwram_off, Some(0x7FF7 | 0x7FFA | 0x7FFB)))
         {
             println!("[bios-bus] write8 addr=0x{:08X} value=0x{:02X}", addr, value);
         }
@@ -215,6 +243,10 @@ impl Bus {
         if (IWRAM_START..IWRAM_START + IWRAM_REGION_SIZE).contains(&addr) {
             let off = ((addr - IWRAM_START) as usize) % IWRAM_SIZE;
             self.iwram[off] = value;
+            if trace_bios_bus_enabled() && (BIOS_HELPER_STATE_START..=BIOS_HELPER_STATE_END).contains(&addr)
+            {
+                println!("[bios-iw] write8 addr=0x{:08X} value=0x{:02X}", addr, value);
+            }
             return;
         }
 
@@ -274,6 +306,7 @@ impl Bus {
             && (addr == REG_IME
                 || addr == REG_IE
                 || addr == REG_IF
+                || (0x0400_0120..=0x0400_0158).contains(&addr)
                 || addr == 0x03FF_FFF8)
         {
             println!("[bios-bus] write16 addr=0x{:08X} value=0x{:04X}", addr, value);
@@ -359,7 +392,7 @@ impl Bus {
     }
 
     pub fn set_keyinput_from_held_mask(&mut self, held_mask: u16) {
-        let keyinput = (!held_mask) & 0x03FF;
+        let keyinput = ((!held_mask) & 0x03FF) | 0xFC00;
         self.write_io16_raw(REG_KEYINPUT, keyinput);
     }
 
@@ -603,5 +636,14 @@ mod tests {
         let mut bus = Bus::new();
         bus.set_keyinput_from_held_mask(0b11);
         assert_eq!(bus.read_io16(REG_KEYINPUT) & 0b11, 0);
+    }
+
+    #[test]
+    fn joybus_registers_initialized() {
+        let bus = Bus::new();
+        assert_eq!(bus.read_io16(REG_JOY_RECV), 0xFFFF);
+        assert_eq!(bus.read_io16(REG_JOY_RECV + 2), 0xFFFF);
+        assert_eq!(bus.read_io16(REG_JOY_TRANS), 0xFFFF);
+        assert_eq!(bus.read_io16(REG_JOY_TRANS + 2), 0xFFFF);
     }
 }

@@ -1051,6 +1051,45 @@ impl Cpu {
     }
 
     fn exec_thumb(&mut self, bus: &mut Bus, instr: u16) -> u32 {
+        let curr_pc = self.pc().wrapping_sub(2);
+
+        if trace_bios_loop_enabled() && (0x0000_1C80..=0x0000_1CBE).contains(&curr_pc) {
+            let r5 = self.regs[5];
+            let b7 = bus.read8(r5.wrapping_add(7));
+            let b0a = bus.read8(r5.wrapping_add(0x0A));
+            let b0b = bus.read8(r5.wrapping_add(0x0B));
+            println!(
+                "[bios-1c8x] pc=0x{:08X} instr=0x{:04X} cpsr=0x{:08X} r0=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} b7=0x{:02X} b0a=0x{:02X} b0b=0x{:02X}",
+                curr_pc,
+                instr,
+                self.cpsr,
+                self.regs[0],
+                r5,
+                self.regs[6],
+                self.regs[7],
+                b7,
+                b0a,
+                b0b
+            );
+        }
+
+        if trace_bios_loop_enabled() && (0x0000_2B34..=0x0000_2FFF).contains(&curr_pc) {
+            println!(
+                "[bios-2b34] pc=0x{:08X} instr=0x{:04X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r5=0x{:08X} r6=0x{:08X} r7=0x{:08X} key=0x{:04X} joy=0x{:08X}",
+                curr_pc,
+                instr,
+                self.regs[0],
+                self.regs[1],
+                self.regs[2],
+                self.regs[3],
+                self.regs[5],
+                self.regs[6],
+                self.regs[7],
+                bus.read_io16(super::bus::REG_KEYINPUT),
+                bus.read32(0x0400_0150)
+            );
+        }
+
         // Format 1: move shifted register.
         if (instr & 0xF800) <= 0x1000 {
             let op = (instr >> 11) & 0x3;
@@ -1539,10 +1578,12 @@ impl Cpu {
         // Conditional branch.
         if (instr & 0xF000) == 0xD000 && (instr & 0x0F00) != 0x0F00 {
             let cond = ((instr >> 8) & 0xF) as u8;
-            let curr_pc = self.pc().wrapping_sub(2);
-            if trace_bios_loop_enabled() && curr_pc == 0x0000_1C66 {
+            if trace_bios_loop_enabled() && (curr_pc == 0x0000_1C66 || (0x0000_1C90..=0x0000_1CA8).contains(&curr_pc)) {
                 println!(
-                    "[bios-1c66] r7=0x{:08X} cpsr=0x{:08X} cond=0x{:X} taken={} instr=0x{:04X}",
+                    "[bios-cond] pc=0x{:08X} r0=0x{:08X} r5=0x{:08X} r7=0x{:08X} cpsr=0x{:08X} cond=0x{:X} taken={} instr=0x{:04X}",
+                    curr_pc,
+                    self.regs[0],
+                    self.regs[5],
                     self.regs[7],
                     self.cpsr,
                     cond,
