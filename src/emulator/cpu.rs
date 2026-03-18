@@ -666,7 +666,7 @@ impl Cpu {
             let shift_type = (instr >> 5) & 0b11;
             let shift_imm = (instr >> 7) & 0x1F;
             let value = self.read_arm_reg(rm);
-            apply_arm_imm_shift(value, shift_type, shift_imm)
+            self.apply_arm_address_shift(value, shift_type, shift_imm)
         };
 
         let base = self.read_arm_reg(rn);
@@ -1393,6 +1393,34 @@ impl Cpu {
         }
     }
 
+    fn apply_arm_address_shift(&self, value: u32, shift_type: u32, shift_imm: u32) -> u32 {
+        match shift_type {
+            0 => value.wrapping_shl(shift_imm),
+            1 => {
+                if shift_imm == 0 {
+                    0
+                } else {
+                    value >> shift_imm
+                }
+            }
+            2 => {
+                if shift_imm == 0 {
+                    if (value >> 31) != 0 { u32::MAX } else { 0 }
+                } else {
+                    ((value as i32) >> shift_imm) as u32
+                }
+            }
+            _ => {
+                if shift_imm == 0 {
+                    let carry_in = if self.flag(CPSR_C) { 1u32 } else { 0u32 };
+                    (carry_in << 31) | (value >> 1)
+                } else {
+                    value.rotate_right(shift_imm)
+                }
+            }
+        }
+    }
+
     fn branch_exchange(&mut self, target: u32) {
         // Real BIOS eventually hands control to cartridge code; if execution is in BIOS
         // and BX resolves to 0, treat that as boot handoff to ROM entry.
@@ -1531,24 +1559,20 @@ impl Cpu {
     }
 
     fn write_cpsr_fields(&mut self, value: u32, field_mask: u8) {
-        // ARM MSR field mask nibble: c x s f mapped to bytes [7:0,15:8,23:16,31:24].
+        // ARM7TDMI: only control byte and NZCV flags are architecturally meaningful.
         let mut mask = 0u32;
         if (field_mask & 0b0001) != 0 {
+            // Control byte: mode bits + IRQ/FIQ disable + state bits.
             mask |= 0x0000_00FF;
         }
-        if (field_mask & 0b0010) != 0 {
-            mask |= 0x0000_FF00;
-        }
-        if (field_mask & 0b0100) != 0 {
-            mask |= 0x00FF_0000;
-        }
         if (field_mask & 0b1000) != 0 {
-            mask |= 0xFF00_0000;
+            // Flags byte, but on ARM7 only NZCV are defined.
+            mask |= 0xF000_0000;
         }
 
         // In User mode, only flag bits are writable.
         if self.mode == CpuMode::User {
-            mask &= 0xFF00_0000;
+            mask &= 0xF000_0000;
         }
 
         let old_mode = self.mode;
@@ -1604,14 +1628,8 @@ impl Cpu {
         if (field_mask & 0b0001) != 0 {
             mask |= 0x0000_00FF;
         }
-        if (field_mask & 0b0010) != 0 {
-            mask |= 0x0000_FF00;
-        }
-        if (field_mask & 0b0100) != 0 {
-            mask |= 0x00FF_0000;
-        }
         if (field_mask & 0b1000) != 0 {
-            mask |= 0xFF00_0000;
+            mask |= 0xF000_0000;
         }
 
         match self.mode {
@@ -1821,34 +1839,6 @@ fn sub_with_flags(lhs: u32, rhs: u32) -> (u32, bool, bool) {
     let carry = !borrow;
     let overflow = (((lhs ^ rhs) & 0x8000_0000) != 0) && (((lhs ^ res) & 0x8000_0000) != 0);
     (res, carry, overflow)
-}
-
-fn apply_arm_imm_shift(value: u32, shift_type: u32, shift_imm: u32) -> u32 {
-    match shift_type {
-        0 => value.wrapping_shl(shift_imm),
-        1 => {
-            if shift_imm == 0 {
-                0
-            } else {
-                value >> shift_imm
-            }
-        }
-        2 => {
-            if shift_imm == 0 {
-                if (value >> 31) != 0 { u32::MAX } else { 0 }
-            } else {
-                ((value as i32) >> shift_imm) as u32
-            }
-        }
-        _ => {
-            if shift_imm == 0 {
-                let carry_in = 0u32;
-                (carry_in << 31) | (value >> 1)
-            } else {
-                value.rotate_right(shift_imm)
-            }
-        }
-    }
 }
 
 impl Default for Cpu {
