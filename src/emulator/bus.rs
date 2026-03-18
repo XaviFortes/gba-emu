@@ -316,6 +316,9 @@ impl Bus {
                 stored = 0;
             }
             self.iwram[off] = stored;
+            if trace_emerald_state_enabled() && (0x0300_22B0..0x0300_22D0).contains(&addr) {
+                println!("[emerald-state] write8 addr=0x{:08X} value=0x{:02X}", addr, stored);
+            }
             if trace_bios_bus_enabled() && (BIOS_HELPER_STATE_START..=BIOS_HELPER_STATE_END).contains(&addr)
             {
                 println!("[bios-iw] write8 addr=0x{:08X} value=0x{:02X}", addr, stored);
@@ -350,8 +353,15 @@ impl Bus {
             {
                 return;
             }
+            let io16_addr = addr & !1;
+            let old_value = self.read_io16_raw(io16_addr);
             let index = (addr - IO_START) as usize;
             self.io[index] = value;
+
+            let new_value = self.read_io16_raw(io16_addr);
+            if new_value != old_value {
+                self.handle_side_effects_16(io16_addr, old_value, new_value);
+            }
             return;
         }
 
@@ -412,6 +422,14 @@ impl Bus {
     }
 
     pub fn write16(&mut self, addr: u32, value: u16) {
+        if trace_emerald_state_enabled() && (0x0300_22B0..0x0300_22D0).contains(&addr) {
+            println!("[emerald-state] write16 addr=0x{:08X} value=0x{:04X}", addr, value);
+        }
+
+        if trace_video_io_enabled() && (0x0400_0000..=0x0400_001E).contains(&addr) {
+            println!("[video-io] write16 addr=0x{:08X} value=0x{:04X}", addr, value);
+        }
+
         if trace_bios_bus_enabled()
             && (addr == REG_DISPCNT
                 || addr == REG_IME
@@ -462,6 +480,10 @@ impl Bus {
     }
 
     pub fn write32(&mut self, addr: u32, value: u32) {
+        if trace_emerald_state_enabled() && (0x0300_22B0..0x0300_22D0).contains(&addr) {
+            println!("[emerald-state] write32 addr=0x{:08X} value=0x{:08X}", addr, value);
+        }
+
         if (IO_START..IO_START + IO_SIZE as u32).contains(&addr) {
             self.write16(addr, (value & 0xFFFF) as u16);
             self.write16(addr.wrapping_add(2), (value >> 16) as u16);
@@ -795,6 +817,24 @@ fn trace_bios_bus_enabled() -> bool {
     static TRACE: OnceLock<bool> = OnceLock::new();
     *TRACE.get_or_init(|| {
         std::env::var("GBA_TRACE_BIOS_BUS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn trace_video_io_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| {
+        std::env::var("GBA_TRACE_VIDEO_IO")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn trace_emerald_state_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| {
+        std::env::var("GBA_TRACE_EMERALD_STATE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })

@@ -232,6 +232,10 @@ impl Cpu {
             if !bus.has_bios() && bus.has_pending_interrupts() {
                 // No BIOS path: SWI IntrWait/Halt should still resume when IF/IE/IME match,
                 // even if we are not entering the BIOS IRQ exception vector.
+                if let Some(mask) = bus.claim_pending_interrupt() {
+                    // Consume one pending source on wake to mimic BIOS IntrWait behavior.
+                    bus.write_io16(super::bus::REG_IF, mask);
+                }
                 self.halted = false;
                 self.cycles += 1;
                 return 1;

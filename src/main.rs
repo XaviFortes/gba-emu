@@ -36,7 +36,7 @@ fn is_probably_executable(pc: u32) -> bool {
 
 fn log_snapshot(prefix: &str, frame: u32, snap: DebugSnapshot) {
     println!(
-        "[{prefix}] frame={frame} pc=0x{:08X} cpsr=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r7=0x{:08X} sp=0x{:08X} lr=0x{:08X} cycles={} dispcnt=0x{:04X} vcount={} ime=0x{:04X} ie=0x{:04X} if=0x{:04X} handoff=0x{:02X} bios_irq_flags=0x{:04X} irq_vec=0x{:08X} irq_check=0x{:04X} bios_steps={} rom_steps={} bg0cnt=0x{:04X} hofs=0x{:04X} vofs=0x{:04X} pal0=0x{:04X} pal1=0x{:04X} vram0=0x{:04X} vram3800=0x{:04X}",
+        "[{prefix}] frame={frame} pc=0x{:08X} cpsr=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r7=0x{:08X} sp=0x{:08X} lr=0x{:08X} cycles={} dispcnt=0x{:04X} vcount={} ime=0x{:04X} ie=0x{:04X} if=0x{:04X} handoff=0x{:02X} bios_irq_flags=0x{:04X} irq_vec=0x{:08X} irq_check=0x{:04X} bios_steps={} rom_steps={} bg0cnt=0x{:04X} hofs=0x{:04X} vofs=0x{:04X} pal0=0x{:04X} pal1=0x{:04X} vram0=0x{:04X} vram10=0x{:04X} vram100=0x{:04X} vram1000=0x{:04X} vram3800=0x{:04X} ew22b4=0x{:04X} ew22b6=0x{:04X} ew22c0=0x{:08X}",
         snap.pc,
         snap.cpsr,
         snap.r0,
@@ -65,7 +65,13 @@ fn log_snapshot(prefix: &str, frame: u32, snap: DebugSnapshot) {
         snap.palette0,
         snap.palette1,
         snap.vram0,
-        snap.vram3800
+        snap.vram10,
+        snap.vram100,
+        snap.vram1000,
+        snap.vram3800,
+        snap.ew_22b4,
+        snap.ew_22b6,
+        snap.ew_22c0
     );
 }
 

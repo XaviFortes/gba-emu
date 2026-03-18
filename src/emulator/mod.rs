@@ -44,7 +44,13 @@ pub struct DebugSnapshot {
     pub palette0: u16,
     pub palette1: u16,
     pub vram0: u16,
+    pub vram10: u16,
+    pub vram100: u16,
+    pub vram1000: u16,
     pub vram3800: u16,
+    pub ew_22b4: u16,
+    pub ew_22b6: u16,
+    pub ew_22c0: u32,
 }
 
 #[derive(Debug)]
@@ -225,7 +231,13 @@ impl Gba {
             palette0: self.bus.read16(0x0500_0000),
             palette1: self.bus.read16(0x0500_0002),
             vram0: self.bus.read16(0x0600_0000),
+            vram10: self.bus.read16(0x0600_0010),
+            vram100: self.bus.read16(0x0600_0100),
+            vram1000: self.bus.read16(0x0600_1000),
             vram3800: self.bus.read16(0x0600_3800),
+            ew_22b4: self.bus.read16(0x0300_22B4),
+            ew_22b6: self.bus.read16(0x0300_22B6),
+            ew_22c0: self.bus.read32(0x0300_22C0),
         }
     }
 

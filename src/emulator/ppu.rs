@@ -91,6 +91,11 @@ impl Ppu {
             if trace_bios_bus_enabled() {
                 println!("[bios-ppu] enter-vblank vcount={}", bus.read_io16(REG_VCOUNT));
             }
+            if !bus.has_bios() {
+                // BIOS-less compatibility: Emerald startup expects this heartbeat
+                // byte to be refreshed by interrupt-driven callback flow.
+                bus.write8(0x0300_22B4, 1);
+            }
             // Start VBlank-timed DMA channels (DMAxCNT_H start timing=01).
             bus.trigger_dma_timing(0b01);
             bus.request_interrupt(IRQ_VBLANK);
