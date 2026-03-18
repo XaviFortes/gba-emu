@@ -223,11 +223,23 @@ impl Cpu {
             return 1;
         }
 
+        // MRS Rd, SPSR
+        if (instr & 0x0FBF_0FFF) == 0x014F_0000 {
+            let rd = ((instr >> 12) & 0xF) as usize;
+            self.regs[rd] = self.current_spsr();
+            return 1;
+        }
+
         // MSR CPSR fields, Rm
         if (instr & 0x0DB0_F000) == 0x0120_F000 {
             let rm = (instr & 0xF) as usize;
             let field_mask = ((instr >> 16) & 0xF) as u8;
-            self.write_cpsr_fields(self.regs[rm], field_mask);
+            let write_spsr = (instr & (1 << 22)) != 0;
+            if write_spsr {
+                self.write_spsr_fields(self.regs[rm], field_mask);
+            } else {
+                self.write_cpsr_fields(self.regs[rm], field_mask);
+            }
             return 1;
         }
 
@@ -237,7 +249,12 @@ impl Cpu {
             let rot = ((instr >> 8) & 0xF) * 2;
             let value = imm8.rotate_right(rot);
             let field_mask = ((instr >> 16) & 0xF) as u8;
-            self.write_cpsr_fields(value, field_mask);
+            let write_spsr = (instr & (1 << 22)) != 0;
+            if write_spsr {
+                self.write_spsr_fields(value, field_mask);
+            } else {
+                self.write_cpsr_fields(value, field_mask);
+            }
             return 1;
         }
 
@@ -269,6 +286,11 @@ impl Cpu {
         // MUL/MLA
         if (instr & 0x0FC0_00F0) == 0x0000_0090 {
             return self.arm_multiply(instr);
+        }
+
+        // SWP / SWPB
+        if (instr & 0x0FB0_0FF0) == 0x0100_0090 {
+            return self.arm_swap(bus, instr);
         }
 
         // ¡AQUÍ ESTÁ LO NUEVO! Long Multiply (UMULL, UMLAL, SMULL, SMLAL)
@@ -414,9 +436,7 @@ impl Cpu {
             bus.write16(addr & !1, value as u16);
         }
 
-        // ¡EL ARREGLO DEL LDRH/STRH!
         let base_machacado = load && (rd == rn);
-        
         if (writeback || !pre) && !base_machacado {
             self.regs[rn] = offset_addr;
         }
@@ -427,6 +447,30 @@ impl Cpu {
         }
 
         3
+    }
+
+    fn arm_swap(&mut self, bus: &mut Bus, instr: u32) -> u32 {
+        let byte = (instr & (1 << 22)) != 0;
+        let rn = ((instr >> 16) & 0xF) as usize;
+        let rd = ((instr >> 12) & 0xF) as usize;
+        let rm = (instr & 0xF) as usize;
+
+        let addr = self.regs[rn];
+        let src = self.regs[rm];
+
+        let old = if byte {
+            let value = bus.read8(addr) as u32;
+            bus.write8(addr, src as u8);
+            value
+        } else {
+            let shift = (addr & 3) * 8;
+            let value = bus.read32(addr & !3).rotate_right(shift);
+            bus.write32(addr & !3, src);
+            value
+        };
+
+        self.regs[rd] = old;
+        4
     }
 
     fn arm_data_processing(&mut self, instr: u32) -> u32 {
@@ -656,7 +700,6 @@ impl Cpu {
             }
         }
 
-        // Protección clave: no machacar el registro base si lo acabamos de leer
         let base_machacado = load && (rd == rn);
         if (writeback || !pre_index) && !base_machacado {
             self.regs[rn] = offset_addr;
@@ -698,21 +741,28 @@ impl Cpu {
             }
 
             if load {
-                self.regs[reg] = bus.read32(addr & !3);
+                let value = bus.read32(addr & !3);
+                if s_bit && !pc_in_list {
+                    self.write_user_reg(reg, value);
+                } else {
+                    self.regs[reg] = value;
+                }
             } else {
-                bus.write32(addr & !3, self.read_arm_reg(reg));
+                let value = if s_bit && !pc_in_list {
+                    self.read_user_reg(reg)
+                } else {
+                    self.read_arm_reg(reg)
+                };
+                bus.write32(addr & !3, value);
             }
 
             addr = addr.wrapping_add(4);
         }
 
         if writeback {
-            // ¿Estamos cargando (load) y además el registro base (rn) está marcado en la lista de registros (reg_list)?
             let base_cargado_de_memoria = load && ((reg_list >> rn) & 1) != 0;
-
-            // Solo hacemos el writeback si el registro base NO acaba de ser sobreescrito por la memoria
+            let bytes = count * 4;
             if !base_cargado_de_memoria {
-                let bytes = count * 4;
                 self.regs[rn] = if up {
                     base.wrapping_add(bytes)
                 } else {
@@ -1496,6 +1546,11 @@ impl Cpu {
             mask |= 0xFF00_0000;
         }
 
+        // In User mode, only flag bits are writable.
+        if self.mode == CpuMode::User {
+            mask &= 0xFF00_0000;
+        }
+
         let old_mode = self.mode;
         let old_mode_bits = self.cpsr & 0x1F;
         let raw = (self.cpsr & !mask) | (value & mask);
@@ -1503,6 +1558,72 @@ impl Cpu {
         let new_mode = mode_from_cpsr(self.cpsr);
         if new_mode != old_mode {
             self.switch_mode(new_mode);
+        }
+    }
+
+    fn current_spsr(&self) -> u32 {
+        match self.mode {
+            CpuMode::Irq => self.spsr_irq,
+            CpuMode::Supervisor => self.spsr_svc,
+            _ => 0,
+        }
+    }
+
+    fn read_user_reg(&self, reg: usize) -> u32 {
+        match reg {
+            REG_SP => match self.mode {
+                CpuMode::Irq | CpuMode::Supervisor => self.banked_sp_sys,
+                _ => self.regs[REG_SP],
+            },
+            REG_LR => match self.mode {
+                CpuMode::Irq | CpuMode::Supervisor => self.banked_lr_sys,
+                _ => self.regs[REG_LR],
+            },
+            REG_PC => self.read_arm_reg(REG_PC),
+            _ => self.regs[reg],
+        }
+    }
+
+    fn write_user_reg(&mut self, reg: usize, value: u32) {
+        match reg {
+            REG_SP => match self.mode {
+                CpuMode::Irq | CpuMode::Supervisor => self.banked_sp_sys = value,
+                _ => self.regs[REG_SP] = value,
+            },
+            REG_LR => match self.mode {
+                CpuMode::Irq | CpuMode::Supervisor => self.banked_lr_sys = value,
+                _ => self.regs[REG_LR] = value,
+            },
+            REG_PC => self.regs[REG_PC] = value & !3,
+            _ => self.regs[reg] = value,
+        }
+    }
+
+    fn write_spsr_fields(&mut self, value: u32, field_mask: u8) {
+        let mut mask = 0u32;
+        if (field_mask & 0b0001) != 0 {
+            mask |= 0x0000_00FF;
+        }
+        if (field_mask & 0b0010) != 0 {
+            mask |= 0x0000_FF00;
+        }
+        if (field_mask & 0b0100) != 0 {
+            mask |= 0x00FF_0000;
+        }
+        if (field_mask & 0b1000) != 0 {
+            mask |= 0xFF00_0000;
+        }
+
+        match self.mode {
+            CpuMode::Irq => {
+                self.spsr_irq = (self.spsr_irq & !mask) | (value & mask);
+            }
+            CpuMode::Supervisor => {
+                self.spsr_svc = (self.spsr_svc & !mask) | (value & mask);
+            }
+            _ => {
+                // Modes without SPSR ignore MSR SPSR writes.
+            }
         }
     }
 
