@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use super::bus::{
-    Bus, IRQ_VBLANK, PALETTE_RAM_START, REG_DISPCNT, REG_DISPSTAT, REG_VCOUNT,
+    Bus, IRQ_VBLANK, OAM_START, PALETTE_RAM_START, REG_DISPCNT, REG_DISPSTAT, REG_VCOUNT,
 };
 
 pub const SCREEN_WIDTH: usize = 240;
@@ -91,6 +91,8 @@ impl Ppu {
             if trace_bios_bus_enabled() {
                 println!("[bios-ppu] enter-vblank vcount={}", bus.read_io16(REG_VCOUNT));
             }
+            // Start VBlank-timed DMA channels (DMAxCNT_H start timing=01).
+            bus.trigger_dma_timing(0b01);
             bus.request_interrupt(IRQ_VBLANK);
         } else {
             dispstat &= !1;
@@ -118,6 +120,11 @@ impl Ppu {
             3 => self.render_mode3_scanline(bus, y),
             4 => self.render_mode4_scanline(bus, y, dispcnt),
             _ => self.clear_scanline(y),
+        }
+
+        // Baseline OBJ pass (normal, non-affine sprites) for all visible modes.
+        if (dispcnt & (1 << 12)) != 0 {
+            self.render_obj_scanline(bus, y, dispcnt);
         }
     }
 
@@ -384,6 +391,107 @@ impl Ppu {
             *px = 0xFF10_1010;
         }
     }
+
+    fn render_obj_scanline(&mut self, bus: &Bus, y: usize, dispcnt: u16) {
+        let one_dim_obj = (dispcnt & (1 << 6)) != 0;
+        let vram = bus.vram();
+        let row_start = y * SCREEN_WIDTH;
+        let y_u16 = y as u16;
+
+        for obj in 0..128usize {
+            let base = OAM_START + (obj as u32) * 8;
+            let attr0 = bus.read16(base);
+            let attr1 = bus.read16(base + 2);
+            let attr2 = bus.read16(base + 4);
+
+            let obj_mode = (attr0 >> 8) & 0x3;
+            let is_affine = (attr0 & (1 << 8)) != 0;
+            let mosaic = (attr0 & (1 << 12)) != 0;
+            let is_8bpp = (attr0 & (1 << 13)) != 0;
+            let shape = (attr0 >> 14) & 0x3;
+            let size = (attr1 >> 14) & 0x3;
+
+            // Skip prohibited, object-window, affine and mosaic for now.
+            if obj_mode == 0b10 || shape == 0b11 || is_affine || mosaic {
+                continue;
+            }
+
+            let (width, height) = match obj_dimensions(shape, size) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let obj_y = attr0 & 0x00FF;
+            let mut obj_x = attr1 & 0x01FF;
+            if obj_x >= 240 {
+                obj_x = obj_x.wrapping_sub(512);
+            }
+
+            if !scanline_hits_obj(y_u16, obj_y, height as u16) {
+                continue;
+            }
+
+            let mut in_obj_y = y_u16.wrapping_sub(obj_y) as usize;
+            let vflip = (attr1 & (1 << 13)) != 0;
+            if vflip {
+                in_obj_y = height - 1 - in_obj_y;
+            }
+
+            let tile_index = (attr2 & 0x03FF) as usize;
+            let palette_bank = ((attr2 >> 12) & 0xF) as usize;
+            let hflip = (attr1 & (1 << 12)) != 0;
+            let units_per_tile = if is_8bpp { 2usize } else { 1usize };
+            let row_units = if one_dim_obj {
+                (width / 8) * units_per_tile
+            } else {
+                32usize
+            };
+
+            for sx in 0..width {
+                let screen_x = (obj_x as i32) + (sx as i32);
+                if !(0..SCREEN_WIDTH as i32).contains(&screen_x) {
+                    continue;
+                }
+
+                let in_obj_x = if hflip { width - 1 - sx } else { sx };
+                let tile_x = in_obj_x / 8;
+                let tile_y = in_obj_y / 8;
+                let pixel_x = in_obj_x % 8;
+                let pixel_y = in_obj_y % 8;
+
+                let tile_units = tile_index
+                    .wrapping_add(tile_y * row_units)
+                    .wrapping_add(tile_x * units_per_tile);
+                let tile_base = 0x1_0000usize + tile_units * 32;
+
+                let color_index = if is_8bpp {
+                    let off = tile_base + pixel_y * 8 + pixel_x;
+                    vram.get(off).copied().unwrap_or(0) as usize
+                } else {
+                    let off = tile_base + pixel_y * 4 + (pixel_x / 2);
+                    let byte = vram.get(off).copied().unwrap_or(0);
+                    if (pixel_x & 1) == 0 {
+                        (byte & 0x0F) as usize
+                    } else {
+                        (byte >> 4) as usize
+                    }
+                };
+
+                if color_index == 0 {
+                    continue;
+                }
+
+                let palette_index = if is_8bpp {
+                    0x100 + color_index
+                } else {
+                    0x100 + palette_bank * 16 + color_index
+                };
+                let color = bus.read16(PALETTE_RAM_START + (palette_index * 2) as u32);
+
+                self.framebuffer[row_start + screen_x as usize] = bgr555_to_argb8888(color);
+            }
+        }
+    }
 }
 
 fn trace_bios_bus_enabled() -> bool {
@@ -438,4 +546,31 @@ fn read_affine_ref(bus: &Bus, addr: u32) -> i32 {
     let raw = bus.read32(addr);
     // BGxX/BGxY are signed 28-bit fixed-point values (s19.8) in IO.
     ((raw << 4) as i32) >> 4
+}
+
+fn obj_dimensions(shape: u16, size: u16) -> Option<(usize, usize)> {
+    match (shape, size) {
+        (0, 0) => Some((8, 8)),
+        (0, 1) => Some((16, 16)),
+        (0, 2) => Some((32, 32)),
+        (0, 3) => Some((64, 64)),
+        (1, 0) => Some((16, 8)),
+        (1, 1) => Some((32, 8)),
+        (1, 2) => Some((32, 16)),
+        (1, 3) => Some((64, 32)),
+        (2, 0) => Some((8, 16)),
+        (2, 1) => Some((8, 32)),
+        (2, 2) => Some((16, 32)),
+        (2, 3) => Some((32, 64)),
+        _ => None,
+    }
+}
+
+fn scanline_hits_obj(scanline: u16, obj_y: u16, height: u16) -> bool {
+    let end = obj_y.wrapping_add(height);
+    if end >= 256 {
+        scanline >= obj_y || scanline < (end & 0x00FF)
+    } else {
+        scanline >= obj_y && scanline < end
+    }
 }

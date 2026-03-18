@@ -38,6 +38,13 @@ pub struct DebugSnapshot {
     pub irq_check: u16,
     pub frame_bios_steps: u32,
     pub frame_rom_steps: u32,
+    pub bg0cnt: u16,
+    pub bg0hofs: u16,
+    pub bg0vofs: u16,
+    pub palette0: u16,
+    pub palette1: u16,
+    pub vram0: u16,
+    pub vram3800: u16,
 }
 
 #[derive(Debug)]
@@ -75,6 +82,7 @@ impl Gba {
         if self.bus.has_bios() {
             self.cpu.force_boot_to_bios();
         } else {
+            println!("[boot] BIOS not present, switching to ROM boot path");
             self.cpu.force_boot_to_rom();
         }
     }
@@ -131,9 +139,6 @@ impl Gba {
 
                     let irq_check_alt = self.bus.read16(0x0300_22F8) | iflags | 0x0001;
                     self.bus.write16(0x0300_22F8, irq_check_alt);
-
-                    // BIOS-less IRQ compatibility: acknowledge handled IRQ bits.
-                    self.bus.write_io16(bus::REG_IF, iflags);
                 }
             }
 
@@ -163,6 +168,7 @@ impl Gba {
                         if std::env::var("GBA_VERBOSE_BOOT").is_ok() {
                             println!("[bios-boot] BIOS completed initialization at 0x{:08X}; handing off to ROM", pc);
                         }
+                        println!("[boot] switching to ROM entry (ARM System mode)");
                         self.force_boot_to_rom_without_bios();
                         self.bios_stall_frame_count = 0;
                         self.last_bios_pc = 0xFFFF_FFFF;
@@ -213,6 +219,13 @@ impl Gba {
             irq_check: self.bus.read16(0x0300_22DC),
             frame_bios_steps: self.last_frame_bios_steps,
             frame_rom_steps: self.last_frame_rom_steps,
+            bg0cnt: self.bus.read_io16(0x0400_0008),
+            bg0hofs: self.bus.read_io16(0x0400_0010),
+            bg0vofs: self.bus.read_io16(0x0400_0012),
+            palette0: self.bus.read16(0x0500_0000),
+            palette1: self.bus.read16(0x0500_0002),
+            vram0: self.bus.read16(0x0600_0000),
+            vram3800: self.bus.read16(0x0600_3800),
         }
     }
 
@@ -221,9 +234,9 @@ impl Gba {
     }
 
     pub fn force_boot_to_rom_without_bios(&mut self) {
+        println!("[boot] disabling BIOS mapping and jumping to ROM entry");
         self.bus.disable_bios();
-        self.bus.reset_for_rom_boot();
-        self.cpu.force_boot_to_rom();
+        self.cpu.jump_to_rom_entry();
     }
 }
 

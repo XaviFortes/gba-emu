@@ -686,12 +686,15 @@ impl Bus {
 
         let mut src = self.read32(sad);
         let mut dst = self.read32(dad);
+        let initial_dst = dst;
         let cnt_l = self.read_io16_raw(cnt_l_addr);
         let mut cnt_h = self.read_io16_raw(cnt_h_addr);
 
         let transfer32 = (cnt_h & (1 << 10)) != 0;
         let src_ctrl = (cnt_h >> 7) & 0b11;
         let dst_ctrl = (cnt_h >> 5) & 0b11;
+        let start_timing = (cnt_h >> 12) & 0b11;
+        let repeat = (cnt_h & (1 << 9)) != 0;
 
         let unit_size = if transfer32 { 4 } else { 2 };
         let mut words = cnt_l as u32;
@@ -712,7 +715,16 @@ impl Bus {
             dst = update_dma_addr(dst, dst_ctrl, unit_size);
         }
 
-        if (cnt_h & (1 << 9)) == 0 {
+        // Update internal source/destination registers like hardware does.
+        self.write_io32_raw(sad, src);
+        if dst_ctrl == 0b11 && repeat && start_timing != 0 {
+            self.write_io32_raw(dad, initial_dst);
+        } else {
+            self.write_io32_raw(dad, dst);
+        }
+
+        // For immediate start, DMA always finishes as one-shot even if repeat is set.
+        if !repeat || start_timing == 0 {
             cnt_h &= !(1 << 15);
             self.write_io16_raw(cnt_h_addr, cnt_h);
         }
@@ -722,10 +734,27 @@ impl Bus {
         }
     }
 
+    pub fn trigger_dma_timing(&mut self, timing: u16) {
+        for channel in 0..4usize {
+            let cnt_h_addr = IO_START + DMA_CNT_H_OFFSETS[channel];
+            let cnt_h = self.read_io16_raw(cnt_h_addr);
+            let enabled = (cnt_h & (1 << 15)) != 0;
+            let start_timing = (cnt_h >> 12) & 0b11;
+            if enabled && start_timing == timing {
+                self.run_dma(channel);
+            }
+        }
+    }
+
     fn write_io16_raw(&mut self, addr: u32, value: u16) {
         let index = (addr - IO_START) as usize;
         self.io[index] = (value & 0x00FF) as u8;
         self.io[index + 1] = (value >> 8) as u8;
+    }
+
+    fn write_io32_raw(&mut self, addr: u32, value: u32) {
+        self.write_io16_raw(addr, (value & 0xFFFF) as u16);
+        self.write_io16_raw(addr.wrapping_add(2), (value >> 16) as u16);
     }
 
     fn read_io16_raw(&self, addr: u32) -> u16 {

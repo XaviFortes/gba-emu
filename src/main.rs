@@ -36,7 +36,7 @@ fn is_probably_executable(pc: u32) -> bool {
 
 fn log_snapshot(prefix: &str, frame: u32, snap: DebugSnapshot) {
     println!(
-        "[{prefix}] frame={frame} pc=0x{:08X} cpsr=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r7=0x{:08X} sp=0x{:08X} lr=0x{:08X} cycles={} dispcnt=0x{:04X} vcount={} ime=0x{:04X} ie=0x{:04X} if=0x{:04X} handoff=0x{:02X} bios_irq_flags=0x{:04X} irq_vec=0x{:08X} irq_check=0x{:04X} bios_steps={} rom_steps={}",
+        "[{prefix}] frame={frame} pc=0x{:08X} cpsr=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X} r4=0x{:08X} r7=0x{:08X} sp=0x{:08X} lr=0x{:08X} cycles={} dispcnt=0x{:04X} vcount={} ime=0x{:04X} ie=0x{:04X} if=0x{:04X} handoff=0x{:02X} bios_irq_flags=0x{:04X} irq_vec=0x{:08X} irq_check=0x{:04X} bios_steps={} rom_steps={} bg0cnt=0x{:04X} hofs=0x{:04X} vofs=0x{:04X} pal0=0x{:04X} pal1=0x{:04X} vram0=0x{:04X} vram3800=0x{:04X}",
         snap.pc,
         snap.cpsr,
         snap.r0,
@@ -58,12 +58,20 @@ fn log_snapshot(prefix: &str, frame: u32, snap: DebugSnapshot) {
         snap.irq_vec,
         snap.irq_check,
         snap.frame_bios_steps,
-        snap.frame_rom_steps
+        snap.frame_rom_steps,
+        snap.bg0cnt,
+        snap.bg0hofs,
+        snap.bg0vofs,
+        snap.palette0,
+        snap.palette1,
+        snap.vram0,
+        snap.vram3800
     );
 }
 
 fn update_progress(prefix: &str, frame: u32, snap: DebugSnapshot, debug: DebugOptions, state: &mut ProgressState) {
-    let delta = snap.pc.wrapping_sub(state.last_pc);
+    let signed_delta = (snap.pc as i64) - (state.last_pc as i64);
+    let abs_delta = signed_delta.unsigned_abs();
 
     if snap.pc == state.last_pc {
         state.same_pc_frames = state.same_pc_frames.saturating_add(1);
@@ -74,14 +82,14 @@ fn update_progress(prefix: &str, frame: u32, snap: DebugSnapshot, debug: DebugOp
     if !is_probably_executable(snap.pc) {
         println!(
             "[{prefix}] anomaly frame={frame} pc=0x{:08X} (non-exec region) prev=0x{:08X} delta=0x{:08X}",
-            snap.pc, state.last_pc, delta
+            snap.pc, state.last_pc, snap.pc.wrapping_sub(state.last_pc)
         );
     }
 
-    if delta > 0x0100_0000 {
+    if abs_delta > 0x0100_0000 {
         println!(
             "[{prefix}] anomaly frame={frame} large-pc-jump prev=0x{:08X} pc=0x{:08X} delta=0x{:08X}",
-            state.last_pc, snap.pc, delta
+            state.last_pc, snap.pc, snap.pc.wrapping_sub(state.last_pc)
         );
     }
 
@@ -286,19 +294,31 @@ fn main() -> ExitCode {
     let bios_provided = bios_path.is_some();
 
     if let Some(bios) = bios_path {
+        println!("[boot] loading BIOS: {}", bios);
         if let Err(err) = gba.load_bios(bios) {
             eprintln!("Failed to load BIOS: {err}");
             return ExitCode::from(1);
         }
+        println!("[boot] BIOS loaded");
     }
 
+    println!("[boot] loading ROM: {}", rom);
     if let Err(err) = gba.load_rom(rom) {
         eprintln!("Failed to load ROM: {err}");
         return ExitCode::from(1);
     }
+    println!("[boot] ROM loaded");
 
     gba.reset();
+    if bios_provided {
+        println!("[boot] entering ARM Supervisor mode via BIOS reset vector");
+    } else {
+        println!("[boot] entering ARM System mode via direct ROM boot");
+    }
     gba.set_trace_branches(trace_branches);
+
+    #[cfg(not(feature = "audio"))]
+    println!("[audio] audio backend disabled at compile-time (build with --features audio)");
 
     // HACK VISUAL: Encendemos la pantalla y ponemos el fondo en un color chillón (magenta)
     // para que sepas que la ventana está refrescando y la memoria gráfica existe.

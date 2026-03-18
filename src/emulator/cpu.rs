@@ -194,6 +194,18 @@ impl Cpu {
         self.set_pc(GAMEPAK_ROM_START);
     }
 
+    pub fn jump_to_rom_entry(&mut self) {
+        // BIOS-preserving handoff: enter ROM at ARM/System mode without wiping
+        // memory/peripheral state established by BIOS initialization.
+        self.switch_mode(CpuMode::System);
+        self.cpsr = (self.cpsr & 0xF000_0000) | 0x0000_001F;
+        self.regs[0] = GAMEPAK_ROM_START;
+        self.regs[1] = 0;
+        self.regs[2] = 0;
+        self.regs[REG_SP] = 0x0300_7F00;
+        self.set_pc(GAMEPAK_ROM_START);
+    }
+
     pub fn force_boot_to_bios(&mut self) {
         // Hardware reset enters ARM Supervisor mode with IRQ/FIQ disabled.
         self.switch_mode(CpuMode::Supervisor);
@@ -206,6 +218,12 @@ impl Cpu {
     }
 
     pub fn step(&mut self, bus: &mut Bus) -> u32 {
+        if self.biosless_irq_active && (self.pc() & !1) == BIOSLESS_IRQ_RETURN_MAGIC {
+            self.finish_biosless_irq_return();
+            self.cycles += 1;
+            return 1;
+        }
+
         if bus.take_halt_request() {
             self.halted = true;
         }
@@ -375,6 +393,58 @@ impl Cpu {
 
         true
     }
+
+    pub fn handle_biosless_irq_callback(&mut self, bus: &mut Bus) -> bool {
+        if bus.has_bios() {
+            return false;
+        }
+        if (self.cpsr & CPSR_IRQ_DISABLE) != 0 {
+            return false;
+        }
+        if !bus.has_pending_interrupts() {
+            return false;
+        }
+
+        let handler = bus.read32(0x03FF_FFFC);
+        if !((0x0200_0000..0x0400_0000).contains(&handler)
+            || (0x0800_0000..0x0E00_0000).contains(&handler))
+        {
+            return false;
+        }
+
+        let Some(_mask) = bus.claim_pending_interrupt() else {
+            return false;
+        };
+
+        self.spsr_irq = self.cpsr;
+        self.switch_mode(CpuMode::Irq);
+        self.regs[REG_LR] = self.pc().wrapping_add(4);
+
+        self.cpsr &= !CPSR_THUMB;
+        self.cpsr |= CPSR_IRQ_DISABLE | CPSR_FIQ_DISABLE;
+
+        self.biosless_irq_active = true;
+        self.biosless_irq_saved[0] = self.regs[0];
+        self.biosless_irq_saved[1] = self.regs[1];
+        self.biosless_irq_saved[2] = self.regs[2];
+        self.biosless_irq_saved[3] = self.regs[3];
+        self.biosless_irq_saved[4] = self.regs[12];
+        self.biosless_irq_lr = self.regs[REG_LR];
+
+        // Match BIOS callback calling convention (r0 = IO base).
+        self.regs[0] = 0x0400_0000;
+        self.regs[REG_LR] = BIOSLESS_IRQ_RETURN_MAGIC;
+        if (handler & 1) != 0 {
+            self.cpsr |= CPSR_THUMB;
+            self.set_pc(handler & !1);
+        } else {
+            self.cpsr &= !CPSR_THUMB;
+            self.set_pc(handler & !3);
+        }
+
+        true
+    }
+
     fn exec_arm(&mut self, bus: &mut Bus, instr: u32) -> u32 {
         let cond = ((instr >> 28) & 0xF) as u8;
         if !self.condition_passed(cond) {
@@ -1825,22 +1895,7 @@ impl Cpu {
 
     fn branch_exchange(&mut self, target: u32) {
         if self.biosless_irq_active && (target & !1) == BIOSLESS_IRQ_RETURN_MAGIC {
-            let return_pc = self.biosless_irq_lr.wrapping_sub(4);
-            self.biosless_irq_active = false;
-
-            self.regs[0] = self.biosless_irq_saved[0];
-            self.regs[1] = self.biosless_irq_saved[1];
-            self.regs[2] = self.biosless_irq_saved[2];
-            self.regs[3] = self.biosless_irq_saved[3];
-            self.regs[12] = self.biosless_irq_saved[4];
-            self.regs[REG_LR] = self.biosless_irq_lr;
-
-            self.restore_cpsr_from_spsr();
-            if self.is_thumb() {
-                self.set_pc(return_pc & !1);
-            } else {
-                self.set_pc(return_pc & !3);
-            }
+            self.finish_biosless_irq_return();
             return;
         }
 
@@ -2216,6 +2271,17 @@ impl Cpu {
     }
 
     fn hle_swi(&mut self, bus: &mut Bus, swi: u8) -> u32 {
+        if trace_hle_swi_enabled() {
+            println!(
+                "[hle-swi] pc=0x{:08X} swi=0x{:02X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X}",
+                self.pc().wrapping_sub(if self.is_thumb() { 2 } else { 4 }),
+                swi,
+                self.regs[0],
+                self.regs[1],
+                self.regs[2]
+            );
+        }
+
         match swi {
             0x00 => {
                 self.set_pc(GAMEPAK_ROM_START);
@@ -2269,7 +2335,33 @@ impl Cpu {
             0x0C => {
                 self.hle_cpuset(bus, true);
             }
-            _ => {}
+            0x11 => {
+                // LZ77UnCompWram(src, dst)
+                let src = self.regs[0];
+                let mut dst = self.regs[1];
+                let data = lz77_decompress(bus, src);
+                for byte in data {
+                    bus.write8(dst, byte);
+                    dst = dst.wrapping_add(1);
+                }
+            }
+            0x12 => {
+                // LZ77UnCompVram(src, dst) writes in 16-bit units.
+                let src = self.regs[0];
+                let mut dst = self.regs[1];
+                let data = lz77_decompress(bus, src);
+                for chunk in data.chunks(2) {
+                    let lo = chunk[0];
+                    let hi = chunk.get(1).copied().unwrap_or(0);
+                    bus.write16(dst & !1, u16::from_le_bytes([lo, hi]));
+                    dst = dst.wrapping_add(2);
+                }
+            }
+            _ => {
+                if trace_hle_swi_enabled() {
+                    println!("[hle-swi] unimplemented swi=0x{:02X}", swi);
+                }
+            }
         }
         6
     }
@@ -2339,6 +2431,27 @@ impl Cpu {
     }
 }
 
+impl Cpu {
+    fn finish_biosless_irq_return(&mut self) {
+        let return_pc = self.biosless_irq_lr.wrapping_sub(4);
+        self.biosless_irq_active = false;
+
+        self.regs[0] = self.biosless_irq_saved[0];
+        self.regs[1] = self.biosless_irq_saved[1];
+        self.regs[2] = self.biosless_irq_saved[2];
+        self.regs[3] = self.biosless_irq_saved[3];
+        self.regs[12] = self.biosless_irq_saved[4];
+        self.regs[REG_LR] = self.biosless_irq_lr;
+
+        self.restore_cpsr_from_spsr();
+        if self.is_thumb() {
+            self.set_pc(return_pc & !1);
+        } else {
+            self.set_pc(return_pc & !3);
+        }
+    }
+}
+
 fn strict_unknown_enabled() -> bool {
     static STRICT: OnceLock<bool> = OnceLock::new();
     *STRICT.get_or_init(|| {
@@ -2355,6 +2468,61 @@ fn trace_msr_enabled() -> bool {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
+}
+
+fn trace_hle_swi_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| {
+        std::env::var("GBA_TRACE_HLE_SWI")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn lz77_decompress(bus: &Bus, src_addr: u32) -> Vec<u8> {
+    let header = bus.read32(src_addr);
+    if (header & 0xFF) != 0x10 {
+        return Vec::new();
+    }
+
+    let decompressed_size = (header >> 8) as usize;
+    let mut src = src_addr.wrapping_add(4);
+    let mut out = Vec::with_capacity(decompressed_size);
+
+    while out.len() < decompressed_size {
+        let flags = bus.read8(src);
+        src = src.wrapping_add(1);
+
+        for bit in 0..8 {
+            if out.len() >= decompressed_size {
+                break;
+            }
+
+            if (flags & (0x80 >> bit)) == 0 {
+                out.push(bus.read8(src));
+                src = src.wrapping_add(1);
+                continue;
+            }
+
+            let b1 = bus.read8(src);
+            let b2 = bus.read8(src.wrapping_add(1));
+            src = src.wrapping_add(2);
+
+            let length = ((b1 >> 4) as usize) + 3;
+            let disp = ((((b1 & 0x0F) as usize) << 8) | (b2 as usize)) + 1;
+
+            for _ in 0..length {
+                if out.len() >= decompressed_size {
+                    break;
+                }
+                let from = out.len().saturating_sub(disp);
+                let value = out.get(from).copied().unwrap_or(0);
+                out.push(value);
+            }
+        }
+    }
+
+    out
 }
 
 fn trace_bios_irq_enabled() -> bool {
