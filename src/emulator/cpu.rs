@@ -231,8 +231,11 @@ impl Cpu {
         }
 
         // MSR CPSR/SPSR fields, Rm
-        // ARM7 treats some non-canonical Rd encodings as still matching MSR.
-        if (instr & 0x0DB0_0FF0) == 0x0120_0000 {
+        // Explicit bitfield decode avoids false positives while accepting non-canonical Rd encodings.
+        let msr_op = (instr >> 23) & 0x1F;
+        let msr_bits_21_20 = (instr >> 20) & 0x3;
+        let msr_low_11_4 = (instr >> 4) & 0xFF;
+        if msr_op == 0b00010 && msr_bits_21_20 == 0b10 && msr_low_11_4 == 0 {
             let rm = (instr & 0xF) as usize;
             let field_mask = ((instr >> 16) & 0xF) as u8;
             let write_spsr = (instr & (1 << 22)) != 0;
@@ -245,7 +248,7 @@ impl Cpu {
         }
 
         // MSR CPSR/SPSR fields, #immediate
-        if (instr & 0x0DB0_0000) == 0x0320_0000 {
+        if msr_op == 0b00110 && msr_bits_21_20 == 0b10 {
             let imm8 = instr & 0xFF;
             let rot = ((instr >> 8) & 0xF) * 2;
             let value = imm8.rotate_right(rot);
@@ -1577,13 +1580,13 @@ impl Cpu {
             mask |= 0x0000_00FF;
         }
         if (field_mask & 0b1000) != 0 {
-            // Preserve full flags/status byte behavior expected by ARM test ROMs.
-            mask |= 0xFF00_0000;
+            // ARM7 has architected NZCV in this byte.
+            mask |= 0xF000_0000;
         }
 
         // In User mode, only flag bits are writable.
         if self.mode == CpuMode::User {
-            mask &= 0xFF00_0000;
+            mask &= 0xF000_0000;
         }
 
         let old_mode = self.mode;
@@ -1640,7 +1643,7 @@ impl Cpu {
             mask |= 0x0000_00FF;
         }
         if (field_mask & 0b1000) != 0 {
-            mask |= 0xFF00_0000;
+            mask |= 0xF000_0000;
         }
 
         match self.mode {
