@@ -37,10 +37,29 @@ pub struct Cpu {
     mode: CpuMode,
     spsr_irq: u32,
     spsr_svc: u32,
+    spsr_fiq: u32,
+    spsr_abt: u32,
+    spsr_und: u32,
     banked_sp_irq: u32,
     banked_lr_irq: u32,
     banked_sp_svc: u32,
     banked_lr_svc: u32,
+    banked_r8_fiq: u32,
+    banked_r9_fiq: u32,
+    banked_r10_fiq: u32,
+    banked_r11_fiq: u32,
+    banked_r12_fiq: u32,
+    banked_sp_fiq: u32,
+    banked_lr_fiq: u32,
+    banked_sp_abt: u32,
+    banked_lr_abt: u32,
+    banked_sp_und: u32,
+    banked_lr_und: u32,
+    banked_r8_sys: u32,
+    banked_r9_sys: u32,
+    banked_r10_sys: u32,
+    banked_r11_sys: u32,
+    banked_r12_sys: u32,
     banked_sp_sys: u32,
     banked_lr_sys: u32,
     pub halted: bool,
@@ -55,10 +74,29 @@ impl Cpu {
             mode: CpuMode::System,
             spsr_irq: 0,
             spsr_svc: 0,
+            spsr_fiq: 0,
+            spsr_abt: 0,
+            spsr_und: 0,
             banked_sp_irq: 0x0300_7FA0,
             banked_lr_irq: 0,
             banked_sp_svc: 0x0300_7FE0,
             banked_lr_svc: 0,
+            banked_r8_fiq: 0,
+            banked_r9_fiq: 0,
+            banked_r10_fiq: 0,
+            banked_r11_fiq: 0,
+            banked_r12_fiq: 0,
+            banked_sp_fiq: 0,
+            banked_lr_fiq: 0,
+            banked_sp_abt: 0,
+            banked_lr_abt: 0,
+            banked_sp_und: 0,
+            banked_lr_und: 0,
+            banked_r8_sys: 0,
+            banked_r9_sys: 0,
+            banked_r10_sys: 0,
+            banked_r11_sys: 0,
+            banked_r12_sys: 0,
             banked_sp_sys: 0x0300_7F00,
             banked_lr_sys: 0,
             halted: false,
@@ -76,10 +114,29 @@ impl Cpu {
         self.mode = CpuMode::System;
         self.spsr_irq = 0;
         self.spsr_svc = 0;
+        self.spsr_fiq = 0;
+        self.spsr_abt = 0;
+        self.spsr_und = 0;
         self.banked_sp_irq = 0x0300_7FA0;
         self.banked_lr_irq = 0;
         self.banked_sp_svc = 0x0300_7FE0;
         self.banked_lr_svc = 0;
+        self.banked_r8_fiq = 0;
+        self.banked_r9_fiq = 0;
+        self.banked_r10_fiq = 0;
+        self.banked_r11_fiq = 0;
+        self.banked_r12_fiq = 0;
+        self.banked_sp_fiq = 0;
+        self.banked_lr_fiq = 0;
+        self.banked_sp_abt = 0;
+        self.banked_lr_abt = 0;
+        self.banked_sp_und = 0;
+        self.banked_lr_und = 0;
+        self.banked_r8_sys = self.regs[8];
+        self.banked_r9_sys = self.regs[9];
+        self.banked_r10_sys = self.regs[10];
+        self.banked_r11_sys = self.regs[11];
+        self.banked_r12_sys = self.regs[12];
         self.banked_sp_sys = self.regs[REG_SP];
         self.banked_lr_sys = self.regs[REG_LR];
         self.halted = false;
@@ -208,6 +265,7 @@ impl Cpu {
         if !self.condition_passed(cond) {
             return 1;
         }
+        let trace_msr = trace_msr_enabled();
 
         // BX Rm
         if (instr & 0x0FFF_FFF0) == 0x012F_FF10 {
@@ -217,52 +275,123 @@ impl Cpu {
         }
 
         // MRS Rd, CPSR
-        // (instr & 0x90) != 0x90 evita que se trague los SWP, MUL, etc.
-        if (instr & 0x0FB0_0000) == 0x0100_0000 && (instr & 0x0000_0090) != 0x0000_0090 {
+        if (instr & 0x0FBF_0FFF) == 0x010F_0000 {
             let rd = ((instr >> 12) & 0xF) as usize;
-            let use_spsr = (instr & (1 << 22)) != 0;
+            self.regs[rd] = self.cpsr;
+            return 1;
+        }
 
-            self.regs[rd] = if use_spsr {
-                self.current_spsr()
-            } else {
-                self.cpsr
-            };
+        // MRS Rd, SPSR
+        if (instr & 0x0FBF_0FFF) == 0x014F_0000 {
+            let rd = ((instr >> 12) & 0xF) as usize;
+            self.regs[rd] = self.current_spsr();
             return 1;
         }
 
         // MSR CPSR/SPSR fields, Rm
         // Explicit bitfield decode avoids false positives while accepting non-canonical Rd encodings.
-        // MSR CPSR/SPSR fields, Rm
         let msr_op = (instr >> 23) & 0x1F;
         let msr_bits_21_20 = (instr >> 20) & 0x3;
-            
-        if msr_op == 0b00010 && msr_bits_21_20 == 0b10 
-            && (instr & 0x0000_0090) != 0x0000_0090 
-            && (instr & 0x0FFFFFF0) != 0x012FFF10 // Evita que se trague el BX
-        {
+
+        if trace_msr && msr_op == 0b00010 && msr_bits_21_20 == 0b10 && (((instr >> 4) & 0xFF) != 0) {
+            println!(
+                "[msr-trace] drop-reg pc=0x{:08X} instr=0x{:08X} mode={:?} rd_bits=0x{:X} low11_4=0x{:02X}",
+                self.pc().wrapping_sub(4),
+                instr,
+                self.mode,
+                (instr >> 12) & 0xF,
+                (instr >> 4) & 0xFF
+            );
+        }
+
+        if msr_op == 0b00010 && msr_bits_21_20 == 0b10 && (((instr >> 4) & 0xFF) == 0) {
             let rm = (instr & 0xF) as usize;
             let field_mask = ((instr >> 16) & 0xF) as u8;
             let value = self.regs[rm];
             let write_spsr = (instr & (1 << 22)) != 0;
+            if trace_msr {
+                let cpsr_before = self.cpsr;
+                let spsr_before = self.current_spsr();
+                println!(
+                    "[msr-trace] reg-before pc=0x{:08X} instr=0x{:08X} mode={:?} rd_bits=0x{:X} rm={} field=0x{:X} spsr={} value=0x{:08X} cpsr=0x{:08X} spsr_cur=0x{:08X}",
+                    self.pc().wrapping_sub(4),
+                    instr,
+                    self.mode,
+                    (instr >> 12) & 0xF,
+                    rm,
+                    field_mask,
+                    write_spsr,
+                    value,
+                    cpsr_before,
+                    spsr_before
+                );
+            }
             if write_spsr {
                 self.write_spsr_fields(value, field_mask);
             } else {
                 self.write_cpsr_fields(value, field_mask);
             }
+            if trace_msr {
+                println!(
+                    "[msr-trace] reg-after  pc=0x{:08X} instr=0x{:08X} mode={:?} cpsr=0x{:08X} spsr_cur=0x{:08X}",
+                    self.pc().wrapping_sub(4),
+                    instr,
+                    self.mode,
+                    self.cpsr,
+                    self.current_spsr()
+                );
+            }
             return 1;
         }
 
         // MSR CPSR/SPSR fields, #immediate
+        if trace_msr && msr_op == 0b00110 && msr_bits_21_20 == 0b10 {
+            println!(
+                "[msr-trace] imm-hit    pc=0x{:08X} instr=0x{:08X} mode={:?} rd_bits=0x{:X}",
+                self.pc().wrapping_sub(4),
+                instr,
+                self.mode,
+                (instr >> 12) & 0xF
+            );
+        }
         if msr_op == 0b00110 && msr_bits_21_20 == 0b10 {
             let imm8 = instr & 0xFF;
             let rot = ((instr >> 8) & 0xF) * 2;
             let value = imm8.rotate_right(rot);
             let field_mask = ((instr >> 16) & 0xF) as u8;
             let write_spsr = (instr & (1 << 22)) != 0;
+            if trace_msr {
+                let cpsr_before = self.cpsr;
+                let spsr_before = self.current_spsr();
+                println!(
+                    "[msr-trace] imm-before pc=0x{:08X} instr=0x{:08X} mode={:?} rd_bits=0x{:X} imm8=0x{:02X} rot={} field=0x{:X} spsr={} value=0x{:08X} cpsr=0x{:08X} spsr_cur=0x{:08X}",
+                    self.pc().wrapping_sub(4),
+                    instr,
+                    self.mode,
+                    (instr >> 12) & 0xF,
+                    imm8,
+                    rot,
+                    field_mask,
+                    write_spsr,
+                    value,
+                    cpsr_before,
+                    spsr_before
+                );
+            }
             if write_spsr {
                 self.write_spsr_fields(value, field_mask);
             } else {
                 self.write_cpsr_fields(value, field_mask);
+            }
+            if trace_msr {
+                println!(
+                    "[msr-trace] imm-after  pc=0x{:08X} instr=0x{:08X} mode={:?} cpsr=0x{:08X} spsr_cur=0x{:08X}",
+                    self.pc().wrapping_sub(4),
+                    instr,
+                    self.mode,
+                    self.cpsr,
+                    self.current_spsr()
+                );
             }
             return 1;
         }
@@ -1504,6 +1633,9 @@ impl Cpu {
         let raw_restored = match self.mode {
             CpuMode::Irq => self.spsr_irq,
             CpuMode::Supervisor => self.spsr_svc,
+            CpuMode::Fiq => self.spsr_fiq,
+            CpuMode::Abort => self.spsr_abt,
+            CpuMode::Undefined => self.spsr_und,
             _ => self.cpsr,
         };
         let restored = sanitize_cpsr_mode_bits(raw_restored, self.cpsr & 0x1F);
@@ -1522,6 +1654,22 @@ impl Cpu {
         }
 
         match self.mode {
+            CpuMode::Fiq => {
+                self.banked_r8_fiq = self.regs[8];
+                self.banked_r9_fiq = self.regs[9];
+                self.banked_r10_fiq = self.regs[10];
+                self.banked_r11_fiq = self.regs[11];
+                self.banked_r12_fiq = self.regs[12];
+                self.banked_sp_fiq = self.regs[REG_SP];
+                self.banked_lr_fiq = self.regs[REG_LR];
+                self.regs[8] = self.banked_r8_sys;
+                self.regs[9] = self.banked_r9_sys;
+                self.regs[10] = self.banked_r10_sys;
+                self.regs[11] = self.banked_r11_sys;
+                self.regs[12] = self.banked_r12_sys;
+                self.regs[REG_SP] = self.banked_sp_sys;
+                self.regs[REG_LR] = self.banked_lr_sys;
+            }
             CpuMode::Irq => {
                 self.banked_sp_irq = self.regs[REG_SP];
                 self.banked_lr_irq = self.regs[REG_LR];
@@ -1534,10 +1682,38 @@ impl Cpu {
                 self.regs[REG_SP] = self.banked_sp_sys;
                 self.regs[REG_LR] = self.banked_lr_sys;
             }
+            CpuMode::Abort => {
+                self.banked_sp_abt = self.regs[REG_SP];
+                self.banked_lr_abt = self.regs[REG_LR];
+                self.regs[REG_SP] = self.banked_sp_sys;
+                self.regs[REG_LR] = self.banked_lr_sys;
+            }
+            CpuMode::Undefined => {
+                self.banked_sp_und = self.regs[REG_SP];
+                self.banked_lr_und = self.regs[REG_LR];
+                self.regs[REG_SP] = self.banked_sp_sys;
+                self.regs[REG_LR] = self.banked_lr_sys;
+            }
             _ => {}
         }
 
         match new_mode {
+            CpuMode::Fiq => {
+                self.banked_r8_sys = self.regs[8];
+                self.banked_r9_sys = self.regs[9];
+                self.banked_r10_sys = self.regs[10];
+                self.banked_r11_sys = self.regs[11];
+                self.banked_r12_sys = self.regs[12];
+                self.banked_sp_sys = self.regs[REG_SP];
+                self.banked_lr_sys = self.regs[REG_LR];
+                self.regs[8] = self.banked_r8_fiq;
+                self.regs[9] = self.banked_r9_fiq;
+                self.regs[10] = self.banked_r10_fiq;
+                self.regs[11] = self.banked_r11_fiq;
+                self.regs[12] = self.banked_r12_fiq;
+                self.regs[REG_SP] = self.banked_sp_fiq;
+                self.regs[REG_LR] = self.banked_lr_fiq;
+            }
             CpuMode::Irq => {
                 self.banked_sp_sys = self.regs[REG_SP];
                 self.banked_lr_sys = self.regs[REG_LR];
@@ -1549,6 +1725,18 @@ impl Cpu {
                 self.banked_lr_sys = self.regs[REG_LR];
                 self.regs[REG_SP] = self.banked_sp_svc;
                 self.regs[REG_LR] = self.banked_lr_svc;
+            }
+            CpuMode::Abort => {
+                self.banked_sp_sys = self.regs[REG_SP];
+                self.banked_lr_sys = self.regs[REG_LR];
+                self.regs[REG_SP] = self.banked_sp_abt;
+                self.regs[REG_LR] = self.banked_lr_abt;
+            }
+            CpuMode::Undefined => {
+                self.banked_sp_sys = self.regs[REG_SP];
+                self.banked_lr_sys = self.regs[REG_LR];
+                self.regs[REG_SP] = self.banked_sp_und;
+                self.regs[REG_LR] = self.banked_lr_und;
             }
             _ => {}
         }
@@ -1578,16 +1766,22 @@ impl Cpu {
     }
 
     fn write_cpsr_fields(&mut self, value: u32, field_mask: u8) {
-        // ARM7TDMI: only control byte and NZCV flags are architecturally meaningful.
         let mut mask = 0u32;
         if (field_mask & 0b0001) != 0 {
-            // Control byte: mode bits + IRQ/FIQ disable + state bits.
             mask |= 0x0000_00FF;
         }
-        if (field_mask & 0b1000) != 0 {
-            // ARM7 has architected NZCV in this byte.
-            mask |= 0xF000_0000;
+        if (field_mask & 0b0010) != 0 {
+            mask |= 0x0000_FF00;
         }
+        if (field_mask & 0b0100) != 0 {
+            mask |= 0x00FF_0000;
+        }
+        if (field_mask & 0b1000) != 0 {
+            mask |= 0xFF00_0000;
+        }
+
+        // ARMv4T: allow only architecturally relevant CPSR bits and block T writes via MSR.
+        mask &= 0xF000_00DF;
 
         // In User mode, only flag bits are writable.
         if self.mode == CpuMode::User {
@@ -1608,18 +1802,41 @@ impl Cpu {
         match self.mode {
             CpuMode::Irq => self.spsr_irq,
             CpuMode::Supervisor => self.spsr_svc,
+            CpuMode::Fiq => self.spsr_fiq,
+            CpuMode::Abort => self.spsr_abt,
+            CpuMode::Undefined => self.spsr_und,
             _ => 0,
         }
     }
 
     fn read_user_reg(&self, reg: usize) -> u32 {
         match reg {
+            8 => match self.mode {
+                CpuMode::Fiq => self.banked_r8_sys,
+                _ => self.regs[8],
+            },
+            9 => match self.mode {
+                CpuMode::Fiq => self.banked_r9_sys,
+                _ => self.regs[9],
+            },
+            10 => match self.mode {
+                CpuMode::Fiq => self.banked_r10_sys,
+                _ => self.regs[10],
+            },
+            11 => match self.mode {
+                CpuMode::Fiq => self.banked_r11_sys,
+                _ => self.regs[11],
+            },
+            12 => match self.mode {
+                CpuMode::Fiq => self.banked_r12_sys,
+                _ => self.regs[12],
+            },
             REG_SP => match self.mode {
-                CpuMode::Irq | CpuMode::Supervisor => self.banked_sp_sys,
+                CpuMode::Fiq | CpuMode::Irq | CpuMode::Supervisor | CpuMode::Abort | CpuMode::Undefined => self.banked_sp_sys,
                 _ => self.regs[REG_SP],
             },
             REG_LR => match self.mode {
-                CpuMode::Irq | CpuMode::Supervisor => self.banked_lr_sys,
+                CpuMode::Fiq | CpuMode::Irq | CpuMode::Supervisor | CpuMode::Abort | CpuMode::Undefined => self.banked_lr_sys,
                 _ => self.regs[REG_LR],
             },
             REG_PC => self.read_arm_reg(REG_PC),
@@ -1629,12 +1846,32 @@ impl Cpu {
 
     fn write_user_reg(&mut self, reg: usize, value: u32) {
         match reg {
+            8 => match self.mode {
+                CpuMode::Fiq => self.banked_r8_sys = value,
+                _ => self.regs[8] = value,
+            },
+            9 => match self.mode {
+                CpuMode::Fiq => self.banked_r9_sys = value,
+                _ => self.regs[9] = value,
+            },
+            10 => match self.mode {
+                CpuMode::Fiq => self.banked_r10_sys = value,
+                _ => self.regs[10] = value,
+            },
+            11 => match self.mode {
+                CpuMode::Fiq => self.banked_r11_sys = value,
+                _ => self.regs[11] = value,
+            },
+            12 => match self.mode {
+                CpuMode::Fiq => self.banked_r12_sys = value,
+                _ => self.regs[12] = value,
+            },
             REG_SP => match self.mode {
-                CpuMode::Irq | CpuMode::Supervisor => self.banked_sp_sys = value,
+                CpuMode::Fiq | CpuMode::Irq | CpuMode::Supervisor | CpuMode::Abort | CpuMode::Undefined => self.banked_sp_sys = value,
                 _ => self.regs[REG_SP] = value,
             },
             REG_LR => match self.mode {
-                CpuMode::Irq | CpuMode::Supervisor => self.banked_lr_sys = value,
+                CpuMode::Fiq | CpuMode::Irq | CpuMode::Supervisor | CpuMode::Abort | CpuMode::Undefined => self.banked_lr_sys = value,
                 _ => self.regs[REG_LR] = value,
             },
             REG_PC => self.regs[REG_PC] = value & !3,
@@ -1647,9 +1884,18 @@ impl Cpu {
         if (field_mask & 0b0001) != 0 {
             mask |= 0x0000_00FF;
         }
-        if (field_mask & 0b1000) != 0 {
-            mask |= 0xF000_0000;
+        if (field_mask & 0b0010) != 0 {
+            mask |= 0x0000_FF00;
         }
+        if (field_mask & 0b0100) != 0 {
+            mask |= 0x00FF_0000;
+        }
+        if (field_mask & 0b1000) != 0 {
+            mask |= 0xFF00_0000;
+        }
+
+        // ARMv4T: reserved SPSR bits [27:8] are treated as zero/ignored.
+        mask &= 0xF000_00FF;
 
         match self.mode {
             CpuMode::Irq => {
@@ -1657,6 +1903,15 @@ impl Cpu {
             }
             CpuMode::Supervisor => {
                 self.spsr_svc = (self.spsr_svc & !mask) | (value & mask);
+            }
+            CpuMode::Fiq => {
+                self.spsr_fiq = (self.spsr_fiq & !mask) | (value & mask);
+            }
+            CpuMode::Abort => {
+                self.spsr_abt = (self.spsr_abt & !mask) | (value & mask);
+            }
+            CpuMode::Undefined => {
+                self.spsr_und = (self.spsr_und & !mask) | (value & mask);
             }
             _ => {
                 // Modes without SPSR ignore MSR SPSR writes.
@@ -1814,6 +2069,15 @@ fn strict_unknown_enabled() -> bool {
     static STRICT: OnceLock<bool> = OnceLock::new();
     *STRICT.get_or_init(|| {
         std::env::var("GBA_STRICT_UNKNOWN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn trace_msr_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| {
+        std::env::var("GBA_TRACE_MSR")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
