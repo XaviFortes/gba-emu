@@ -72,6 +72,8 @@ const TIMER_RELOAD_OFFSETS: [u32; 4] = [0x100, 0x104, 0x108, 0x10C];
 const TIMER_CTRL_OFFSETS: [u32; 4] = [0x102, 0x106, 0x10A, 0x10E];
 const TIMER_IRQ_MASKS: [u16; 4] = [IRQ_TIMER0, IRQ_TIMER1, IRQ_TIMER2, IRQ_TIMER3];
 const TIMER_PRESCALERS: [u32; 4] = [1, 64, 256, 1024];
+const FLASH_ID_MANUFACTURER: u8 = 0x62;
+const FLASH_ID_DEVICE: u8 = 0x13;
 
 #[derive(Debug, Clone, Copy)]
 struct TimerState {
@@ -92,6 +94,8 @@ pub struct Bus {
     rom: Vec<u8>,
     timers: [TimerState; 4],
     halt_requested: bool,
+    flash_cmd_stage: u8,
+    flash_id_mode: bool,
 }
 
 impl Bus {
@@ -114,6 +118,8 @@ impl Bus {
                 4
             ],
             halt_requested: false,
+            flash_cmd_stage: 0,
+            flash_id_mode: false,
         };
         bus.write_io16_raw(REG_KEYINPUT, 0xFFFF);
         // Joybus idle state (no host attached) prevents BIOS link polling deadlocks.
@@ -147,6 +153,8 @@ impl Bus {
             4
         ];
         self.halt_requested = false;
+        self.flash_cmd_stage = 0;
+        self.flash_id_mode = false;
 
         // Reapply power-on peripheral defaults used by no-BIOS startup.
         self.write_io16_raw(REG_KEYINPUT, 0xFFFF);
@@ -237,8 +245,21 @@ impl Bus {
         }
 
         if (GAMEPAK_SRAM_START..GAMEPAK_SRAM_END).contains(&addr) {
-            // Backup memory is unimplemented for now; open-bus style fallback.
-            return 0xFF;
+            let off = (addr - GAMEPAK_SRAM_START) & 0xFFFF;
+            let value = if self.flash_id_mode {
+                match off {
+                    0x0000 => FLASH_ID_MANUFACTURER,
+                    0x0001 => FLASH_ID_DEVICE,
+                    _ => 0xFF,
+                }
+            } else {
+                // Backup memory data is still unimplemented; keep open-bus fallback.
+                0xFF
+            };
+            if trace_bios_bus_enabled() {
+                println!("[bios-sram] read8 addr=0x{:08X} -> 0x{:02X}", addr, value);
+            }
+            return value;
         }
 
         0
@@ -266,7 +287,9 @@ impl Bus {
         };
 
         if trace_bios_bus_enabled()
-            && (addr == REG_IME
+            && (addr == REG_DISPCNT
+                || addr == REG_DISPCNT + 1
+                || addr == REG_IME
                 || addr == REG_IE
                 || addr == REG_IE + 1
                 || addr == REG_IF
@@ -348,12 +371,50 @@ impl Bus {
 
         if (OAM_START..OAM_START + OAM_SIZE as u32).contains(&addr) {
             self.oam[(addr - OAM_START) as usize] = value;
+            return;
+        }
+
+        if (GAMEPAK_SRAM_START..GAMEPAK_SRAM_END).contains(&addr) {
+            let off = (addr - GAMEPAK_SRAM_START) & 0xFFFF;
+
+            match self.flash_cmd_stage {
+                0 => {
+                    if off == 0x5555 && value == 0xAA {
+                        self.flash_cmd_stage = 1;
+                    } else if value == 0xF0 {
+                        self.flash_id_mode = false;
+                    }
+                }
+                1 => {
+                    if off == 0x2AAA && value == 0x55 {
+                        self.flash_cmd_stage = 2;
+                    } else {
+                        self.flash_cmd_stage = 0;
+                    }
+                }
+                _ => {
+                    if off == 0x5555 {
+                        match value {
+                            0x90 => self.flash_id_mode = true,
+                            0xF0 => self.flash_id_mode = false,
+                            _ => {}
+                        }
+                    }
+                    self.flash_cmd_stage = 0;
+                }
+            }
+
+            if trace_bios_bus_enabled() {
+                println!("[bios-sram] write8 addr=0x{:08X} value=0x{:02X} id_mode={}", addr, value, self.flash_id_mode);
+            }
+            return;
         }
     }
 
     pub fn write16(&mut self, addr: u32, value: u16) {
         if trace_bios_bus_enabled()
-            && (addr == REG_IME
+            && (addr == REG_DISPCNT
+                || addr == REG_IME
                 || addr == REG_IE
                 || addr == REG_IF
                 || (0x0400_0120..=0x0400_0158).contains(&addr)
