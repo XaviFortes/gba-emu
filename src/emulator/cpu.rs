@@ -230,8 +230,9 @@ impl Cpu {
             return 1;
         }
 
-        // MSR CPSR fields, Rm
-        if (instr & 0x0DB0_F000) == 0x0120_F000 {
+        // MSR CPSR/SPSR fields, Rm
+        // ARM7 treats some non-canonical Rd encodings as still matching MSR.
+        if (instr & 0x0DB0_0FF0) == 0x0120_0000 {
             let rm = (instr & 0xF) as usize;
             let field_mask = ((instr >> 16) & 0xF) as u8;
             let write_spsr = (instr & (1 << 22)) != 0;
@@ -243,8 +244,8 @@ impl Cpu {
             return 1;
         }
 
-        // MSR CPSR fields, #immediate
-        if (instr & 0x0DB0_F000) == 0x0320_F000 {
+        // MSR CPSR/SPSR fields, #immediate
+        if (instr & 0x0DB0_0000) == 0x0320_0000 {
             let imm8 = instr & 0xFF;
             let rot = ((instr >> 8) & 0xF) * 2;
             let value = imm8.rotate_right(rot);
@@ -1009,28 +1010,33 @@ impl Cpu {
             let h2 = ((instr >> 6) & 1) as usize;
             let rs = (((instr >> 3) & 0x7) as usize) | (h2 << 3);
             let rd = ((instr & 0x7) as usize) | (h1 << 3);
+            let rhs = if rs == REG_PC {
+                (self.pc().wrapping_add(2)) & !3
+            } else {
+                self.regs[rs]
+            };
 
             match op {
                 0 => {
-                    self.regs[rd] = self.regs[rd].wrapping_add(self.regs[rs]);
+                    self.regs[rd] = self.regs[rd].wrapping_add(rhs);
                     if rd == REG_PC {
                         self.regs[REG_PC] &= !3;
                     }
                 }
                 1 => {
-                    let (res, c, v) = sub_with_flags(self.regs[rd], self.regs[rs]);
+                    let (res, c, v) = sub_with_flags(self.regs[rd], rhs);
                     self.set_nz(res);
                     self.set_flag(CPSR_C, c);
                     self.set_flag(CPSR_V, v);
                 }
                 2 => {
-                    self.regs[rd] = self.regs[rs];
+                    self.regs[rd] = rhs;
                     if rd == REG_PC {
                         self.regs[REG_PC] &= !1;
                     }
                 }
                 _ => {
-                    self.branch_exchange(self.regs[rs]);
+                    self.branch_exchange(rhs);
                 }
             }
             return 3;
@@ -1283,8 +1289,13 @@ impl Cpu {
     fn decode_shifted_register_operand(&self, instr: u32) -> (u32, bool) {
         let rm = (instr & 0xF) as usize;
         let shift_type = (instr >> 5) & 0b11;
-        let value = self.read_arm_reg(rm);
         let register_shift = (instr & (1 << 4)) != 0;
+        let value = if register_shift && rm == REG_PC {
+            // ARM quirk: for register-specified shifts, Rm=PC reads as current instruction + 12.
+            self.pc().wrapping_add(8)
+        } else {
+            self.read_arm_reg(rm)
+        };
 
         if register_shift {
             let rs = ((instr >> 8) & 0xF) as usize;
@@ -1566,13 +1577,13 @@ impl Cpu {
             mask |= 0x0000_00FF;
         }
         if (field_mask & 0b1000) != 0 {
-            // Flags byte, but on ARM7 only NZCV are defined.
-            mask |= 0xF000_0000;
+            // Preserve full flags/status byte behavior expected by ARM test ROMs.
+            mask |= 0xFF00_0000;
         }
 
         // In User mode, only flag bits are writable.
         if self.mode == CpuMode::User {
-            mask &= 0xF000_0000;
+            mask &= 0xFF00_0000;
         }
 
         let old_mode = self.mode;
@@ -1629,7 +1640,7 @@ impl Cpu {
             mask |= 0x0000_00FF;
         }
         if (field_mask & 0b1000) != 0 {
-            mask |= 0xF000_0000;
+            mask |= 0xFF00_0000;
         }
 
         match self.mode {
