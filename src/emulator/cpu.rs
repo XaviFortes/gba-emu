@@ -1489,7 +1489,7 @@ impl Cpu {
             let imm = ((instr & 0xFF) as u32) << 2;
             // Thumb literal uses (address of current instruction + 4), word-aligned.
             let addr = ((self.pc().wrapping_add(2)) & !3).wrapping_add(imm);
-            self.regs[rd] = bus.read32(addr & !3);
+            self.regs[rd] = self.load_word_unaligned(bus, addr);
             return 3;
         }
 
@@ -1503,13 +1503,13 @@ impl Cpu {
 
             match op {
                 0b000 => bus.write32(addr & !3, self.regs[rd]),
-                0b001 => self.regs[rd] = bus.read32(addr & !3),
+                0b001 => self.regs[rd] = self.load_word_unaligned(bus, addr),
                 0b010 => bus.write8(addr, self.regs[rd] as u8),
                 0b011 => self.regs[rd] = bus.read8(addr) as u32,
                 0b100 => bus.write16(addr & !1, self.regs[rd] as u16),
                 0b101 => self.regs[rd] = (bus.read8(addr) as i8) as i32 as u32,
-                0b110 => self.regs[rd] = bus.read16(addr & !1) as u32,
-                _ => self.regs[rd] = (bus.read16(addr & !1) as i16) as i32 as u32,
+                0b110 => self.regs[rd] = self.load_halfword_unaligned(bus, addr) as u32,
+                _ => self.regs[rd] = self.load_signed_halfword_unaligned(bus, addr),
             }
             return 2;
         }
@@ -1529,7 +1529,7 @@ impl Cpu {
                 }
                 1 => {
                     let addr = base.wrapping_add(offset5 << 2);
-                    self.regs[rd] = bus.read32(addr & !3);
+                    self.regs[rd] = self.load_word_unaligned(bus, addr);
                 }
                 2 => {
                     let addr = base.wrapping_add(offset5);
@@ -1551,7 +1551,7 @@ impl Cpu {
             let rd = (instr & 0x7) as usize;
             let addr = self.regs[rb].wrapping_add(offset5 << 1);
             if load {
-                self.regs[rd] = bus.read16(addr & !1) as u32;
+                self.regs[rd] = self.load_halfword_unaligned(bus, addr) as u32;
             } else {
                 bus.write16(addr & !1, self.regs[rd] as u16);
             }
@@ -1565,7 +1565,7 @@ impl Cpu {
             let imm = ((instr & 0xFF) as u32) << 2;
             let addr = self.regs[REG_SP].wrapping_add(imm);
             if load {
-                self.regs[rd] = bus.read32(addr & !3);
+                self.regs[rd] = self.load_word_unaligned(bus, addr);
             } else {
                 bus.write32(addr & !3, self.regs[rd]);
             }
@@ -1866,6 +1866,28 @@ impl Cpu {
                     (res, carry)
                 }
             }
+        }
+    }
+
+    fn load_word_unaligned(&self, bus: &Bus, addr: u32) -> u32 {
+        let aligned = bus.read32(addr & !3);
+        aligned.rotate_right((addr & 3) * 8)
+    }
+
+    fn load_halfword_unaligned(&self, bus: &Bus, addr: u32) -> u16 {
+        let aligned = bus.read16(addr & !1);
+        if (addr & 1) != 0 {
+            aligned.rotate_right(8)
+        } else {
+            aligned
+        }
+    }
+
+    fn load_signed_halfword_unaligned(&self, bus: &Bus, addr: u32) -> u32 {
+        if (addr & 1) != 0 {
+            (bus.read8(addr) as i8) as i32 as u32
+        } else {
+            (bus.read16(addr) as i16) as i32 as u32
         }
     }
 
