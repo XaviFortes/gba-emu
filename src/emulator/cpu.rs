@@ -450,6 +450,10 @@ impl Cpu {
     }
 
     fn exec_arm(&mut self, bus: &mut Bus, instr: u32) -> u32 {
+        if is_armv5te_only_arm_opcode(instr) {
+            return self.unknown_arm(instr);
+        }
+
         let cond = ((instr >> 28) & 0xF) as u8;
         if !self.condition_passed(cond) {
             return 1;
@@ -2495,6 +2499,30 @@ fn strict_unknown_enabled() -> bool {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
+}
+
+fn is_armv5te_only_arm_opcode(instr: u32) -> bool {
+    // BLX (register) -- ARMv5T+
+    if (instr & 0x0FFF_FFF0) == 0x012F_FF30 {
+        return true;
+    }
+
+    // CLZ -- ARMv5+
+    if (instr & 0x0FFF_0FF0) == 0x016F_0F10 {
+        return true;
+    }
+
+    // QADD/QSUB/QDADD/QDSUB -- ARMv5TE+
+    if (instr & 0x0F90_00F0) == 0x0100_0050 {
+        return true;
+    }
+
+    // BKPT -- ARMv5+
+    if (instr & 0x0FF0_00F0) == 0x0120_0070 {
+        return true;
+    }
+
+    false
 }
 
 fn trace_msr_enabled() -> bool {
