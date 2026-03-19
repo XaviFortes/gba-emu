@@ -1495,21 +1495,31 @@ impl Cpu {
 
         // Register-offset load/store and sign/halfword group.
         if (instr & 0xF000) == 0x5000 {
-            let op = (instr >> 9) & 0x7;
             let rm = ((instr >> 6) & 0x7) as usize;
             let rb = ((instr >> 3) & 0x7) as usize;
             let rd = (instr & 0x7) as usize;
             let addr = self.regs[rb].wrapping_add(self.regs[rm]);
 
-            match op {
-                0b000 => bus.write32(addr & !3, self.regs[rd]),
-                0b001 => self.regs[rd] = self.load_word_unaligned(bus, addr),
-                0b010 => bus.write8(addr, self.regs[rd] as u8),
-                0b011 => self.regs[rd] = bus.read8(addr) as u32,
-                0b100 => bus.write16(addr & !1, self.regs[rd] as u16),
-                0b101 => self.regs[rd] = (bus.read8(addr) as i8) as i32 as u32,
-                0b110 => self.regs[rd] = self.load_halfword_unaligned(bus, addr) as u32,
-                _ => self.regs[rd] = self.load_signed_halfword_unaligned(bus, addr),
+            if ((instr >> 9) & 1) == 0 {
+                // Format 7: 0101 L B 0 Rm Rb Rd
+                let load = ((instr >> 11) & 1) != 0;
+                let byte = ((instr >> 10) & 1) != 0;
+                match (load, byte) {
+                    (false, false) => bus.write32(addr & !3, self.regs[rd]),
+                    (false, true) => bus.write8(addr, self.regs[rd] as u8),
+                    (true, false) => self.regs[rd] = self.load_word_unaligned(bus, addr),
+                    (true, true) => self.regs[rd] = bus.read8(addr) as u32,
+                }
+            } else {
+                // Format 8: 0101 H S 1 Rm Rb Rd
+                let h = ((instr >> 11) & 1) != 0;
+                let s = ((instr >> 10) & 1) != 0;
+                match (h, s) {
+                    (false, false) => bus.write16(addr & !1, self.regs[rd] as u16),
+                    (false, true) => self.regs[rd] = (bus.read8(addr) as i8) as i32 as u32,
+                    (true, false) => self.regs[rd] = self.load_halfword_unaligned(bus, addr) as u32,
+                    (true, true) => self.regs[rd] = self.load_signed_halfword_unaligned(bus, addr),
+                }
             }
             return 2;
         }
