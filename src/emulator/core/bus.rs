@@ -30,6 +30,9 @@ pub const GAMEPAK_ROM_START: u32 = 0x0800_0000;
 const GAMEPAK_ROM_END: u32 = 0x0E00_0000;
 const GAMEPAK_SRAM_START: u32 = 0x0E00_0000;
 const GAMEPAK_SRAM_END: u32 = 0x0E01_0000;
+const GAMEPAK_GPIO_DATA_OFFSET: u32 = 0x0000_00C4;
+const GAMEPAK_GPIO_DIR_OFFSET: u32 = 0x0000_00C6;
+const GAMEPAK_GPIO_CNT_OFFSET: u32 = 0x0000_00C8;
 
 pub const REG_DISPCNT: u32 = IO_START + 0x000;
 pub const REG_DISPSTAT: u32 = IO_START + 0x004;
@@ -85,6 +88,14 @@ struct TimerState {
     reload: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RtcTransferState {
+    Idle,
+    Command,
+    Read,
+    Write,
+}
+
 #[derive(Debug)]
 pub struct Bus {
     bios: [u8; BIOS_SIZE],
@@ -101,6 +112,20 @@ pub struct Bus {
     halt_requested: bool,
     flash_cmd_stage: u8,
     flash_id_mode: bool,
+    gamepak_gpio_data: u8,
+    gamepak_gpio_dir: u8,
+    gamepak_gpio_cnt: u8,
+    rtc_state: RtcTransferState,
+    rtc_prev_sck: bool,
+    rtc_prev_cs: bool,
+    rtc_cmd: u8,
+    rtc_cmd_bits: u8,
+    rtc_cur_reg: u8,
+    rtc_transfer_len: u8,
+    rtc_transfer_index: u8,
+    rtc_byte: u8,
+    rtc_byte_bits: u8,
+    rtc_sio_out_bit: u8,
     cpu_exec_pc: Cell<u32>,
     bios_last_opcode: Cell<u32>,
 }
@@ -128,6 +153,20 @@ impl Bus {
             halt_requested: false,
             flash_cmd_stage: 0,
             flash_id_mode: false,
+            gamepak_gpio_data: 0,
+            gamepak_gpio_dir: 0,
+            gamepak_gpio_cnt: 0,
+            rtc_state: RtcTransferState::Idle,
+            rtc_prev_sck: false,
+            rtc_prev_cs: false,
+            rtc_cmd: 0,
+            rtc_cmd_bits: 0,
+            rtc_cur_reg: 0,
+            rtc_transfer_len: 0,
+            rtc_transfer_index: 0,
+            rtc_byte: 0,
+            rtc_byte_bits: 0,
+            rtc_sio_out_bit: 0,
             cpu_exec_pc: Cell::new(0),
             // Hardware returns the last fetched BIOS opcode when BIOS is protected.
             bios_last_opcode: Cell::new(0xE129_F000),
@@ -167,6 +206,20 @@ impl Bus {
         self.halt_requested = false;
         self.flash_cmd_stage = 0;
         self.flash_id_mode = false;
+        self.gamepak_gpio_data = 0;
+        self.gamepak_gpio_dir = 0;
+        self.gamepak_gpio_cnt = 0;
+        self.rtc_state = RtcTransferState::Idle;
+        self.rtc_prev_sck = false;
+        self.rtc_prev_cs = false;
+        self.rtc_cmd = 0;
+        self.rtc_cmd_bits = 0;
+        self.rtc_cur_reg = 0;
+        self.rtc_transfer_len = 0;
+        self.rtc_transfer_index = 0;
+        self.rtc_byte = 0;
+        self.rtc_byte_bits = 0;
+        self.rtc_sio_out_bit = 0;
 
         // Reapply power-on peripheral defaults used by no-BIOS startup.
         self.write_io16_raw(REG_KEYINPUT, 0xFFFF);
@@ -254,6 +307,10 @@ impl Bus {
 
         if (OAM_START..OAM_START + OAM_SIZE as u32).contains(&addr) {
             return self.oam[(addr - OAM_START) as usize];
+        }
+
+        if let Some(offset) = gamepak_gpio_offset(addr) {
+            return self.read_gamepak_gpio8(offset);
         }
 
         if (GAMEPAK_ROM_START..GAMEPAK_ROM_END).contains(&addr) {
@@ -366,6 +423,11 @@ impl Bus {
                 self.read16(0x0300_22DC),
                 self.read16(0x0300_22F8)
             );
+        }
+
+        if let Some(offset) = gamepak_gpio_offset(addr) {
+            self.write_gamepak_gpio8(offset, value);
+            return;
         }
 
         if (EWRAM_START..EWRAM_START + EWRAM_REGION_SIZE).contains(&addr) {
@@ -484,6 +546,171 @@ impl Bus {
             }
             return;
         }
+    }
+
+    fn read_gamepak_gpio8(&self, offset: u32) -> u8 {
+        match offset {
+            GAMEPAK_GPIO_DATA_OFFSET => {
+                let mut data = self.gamepak_gpio_data & self.gamepak_gpio_dir;
+                if (self.gamepak_gpio_dir & 0x02) == 0 {
+                    data |= (self.rtc_sio_out_bit & 1) << 1;
+                }
+                data
+            }
+            o if o == GAMEPAK_GPIO_DATA_OFFSET + 1 => 0,
+            GAMEPAK_GPIO_DIR_OFFSET => self.gamepak_gpio_dir,
+            o if o == GAMEPAK_GPIO_DIR_OFFSET + 1 => 0,
+            GAMEPAK_GPIO_CNT_OFFSET => self.gamepak_gpio_cnt,
+            o if o == GAMEPAK_GPIO_CNT_OFFSET + 1 => 0,
+            _ => 0,
+        }
+    }
+
+    fn write_gamepak_gpio8(&mut self, offset: u32, value: u8) {
+        match offset {
+            GAMEPAK_GPIO_DATA_OFFSET => {
+                self.gamepak_gpio_data = value & 0x07;
+                self.rtc_handle_gpio_lines();
+            }
+            GAMEPAK_GPIO_DIR_OFFSET => {
+                self.gamepak_gpio_dir = value & 0x07;
+            }
+            GAMEPAK_GPIO_CNT_OFFSET => {
+                self.gamepak_gpio_cnt = value & 0x01;
+            }
+            _ => {}
+        }
+    }
+
+    fn rtc_handle_gpio_lines(&mut self) {
+        if (self.gamepak_gpio_cnt & 1) == 0 {
+            return;
+        }
+
+        let cs = (self.gamepak_gpio_data & 0x04) != 0;
+        let sck = (self.gamepak_gpio_data & 0x01) != 0;
+        let sio_in = (self.gamepak_gpio_data >> 1) & 1;
+
+        if cs && !self.rtc_prev_cs {
+            self.rtc_state = RtcTransferState::Command;
+            self.rtc_cmd = 0;
+            self.rtc_cmd_bits = 0;
+            self.rtc_byte = 0;
+            self.rtc_byte_bits = 0;
+            self.rtc_transfer_index = 0;
+            self.rtc_sio_out_bit = 0;
+        }
+
+        if !cs && self.rtc_prev_cs {
+            self.rtc_state = RtcTransferState::Idle;
+            self.rtc_cmd = 0;
+            self.rtc_cmd_bits = 0;
+            self.rtc_byte = 0;
+            self.rtc_byte_bits = 0;
+            self.rtc_sio_out_bit = 0;
+        }
+
+        if cs && !self.rtc_prev_sck && sck {
+            match self.rtc_state {
+                RtcTransferState::Command => {
+                    self.rtc_cmd |= sio_in << self.rtc_cmd_bits;
+                    self.rtc_cmd_bits = self.rtc_cmd_bits.saturating_add(1);
+                    if self.rtc_cmd_bits >= 8 {
+                        self.rtc_finalize_command();
+                    }
+                }
+                RtcTransferState::Write => {
+                    self.rtc_byte |= sio_in << self.rtc_byte_bits;
+                    self.rtc_byte_bits = self.rtc_byte_bits.saturating_add(1);
+                    if self.rtc_byte_bits >= 8 {
+                        self.rtc_write_byte(self.rtc_cur_reg, self.rtc_transfer_index, self.rtc_byte);
+                        self.rtc_transfer_index = self.rtc_transfer_index.saturating_add(1);
+                        self.rtc_byte = 0;
+                        self.rtc_byte_bits = 0;
+                        if self.rtc_transfer_index >= self.rtc_transfer_len {
+                            self.rtc_state = RtcTransferState::Command;
+                            self.rtc_cmd = 0;
+                            self.rtc_cmd_bits = 0;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if cs && self.rtc_prev_sck && !sck && self.rtc_state == RtcTransferState::Read {
+            self.rtc_byte_bits = self.rtc_byte_bits.saturating_add(1);
+            if self.rtc_byte_bits >= 8 {
+                self.rtc_transfer_index = self.rtc_transfer_index.saturating_add(1);
+                self.rtc_byte_bits = 0;
+                if self.rtc_transfer_index >= self.rtc_transfer_len {
+                    self.rtc_state = RtcTransferState::Command;
+                    self.rtc_cmd = 0;
+                    self.rtc_cmd_bits = 0;
+                    self.rtc_sio_out_bit = 0;
+                }
+            }
+
+            if self.rtc_state == RtcTransferState::Read {
+                let b = self.rtc_read_byte(self.rtc_cur_reg, self.rtc_transfer_index);
+                self.rtc_sio_out_bit = (b >> self.rtc_byte_bits) & 1;
+            }
+        }
+
+        self.rtc_prev_cs = cs;
+        self.rtc_prev_sck = sck;
+    }
+
+    fn rtc_finalize_command(&mut self) {
+        let cmd = self.rtc_cmd;
+        self.rtc_cur_reg = (cmd >> 1) & 0x07;
+        let is_read = (cmd & 1) != 0;
+        self.rtc_transfer_len = rtc_transfer_len_for_reg(self.rtc_cur_reg);
+        self.rtc_transfer_index = 0;
+        self.rtc_byte = 0;
+        self.rtc_byte_bits = 0;
+
+        if is_read {
+            self.rtc_state = RtcTransferState::Read;
+            let b = self.rtc_read_byte(self.rtc_cur_reg, 0);
+            self.rtc_sio_out_bit = b & 1;
+        } else {
+            self.rtc_state = RtcTransferState::Write;
+            self.rtc_sio_out_bit = 0;
+        }
+
+        self.rtc_cmd = 0;
+        self.rtc_cmd_bits = 0;
+    }
+
+    fn rtc_read_byte(&self, reg: u8, index: u8) -> u8 {
+        // Minimal stable RTC view for games that probe battery-backed clock.
+        // Values are static but valid BCD fields to avoid probe failure.
+        match reg {
+            0 => 0x00,
+            1 => 0x40,
+            2 => match index {
+                0 => 0x00,
+                1 => 0x00,
+                2 => 0x12,
+                3 => 0x01,
+                4 => 0x01,
+                5 => 0x01,
+                6 => 0x24,
+                _ => 0x00,
+            },
+            3 => match index {
+                0 => 0x00,
+                1 => 0x00,
+                2 => 0x12,
+                _ => 0x00,
+            },
+            _ => 0x00,
+        }
+    }
+
+    fn rtc_write_byte(&mut self, reg: u8, index: u8, value: u8) {
+        let _ = (reg, index, value);
     }
 
     pub fn write16(&mut self, addr: u32, value: u16) {
@@ -906,6 +1133,26 @@ impl Bus {
     fn read_io16_raw(&self, addr: u32) -> u16 {
         let index = (addr - IO_START) as usize;
         self.io[index] as u16 | ((self.io[index + 1] as u16) << 8)
+    }
+}
+
+fn gamepak_gpio_offset(addr: u32) -> Option<u32> {
+    if !(GAMEPAK_ROM_START..GAMEPAK_ROM_END).contains(&addr) {
+        return None;
+    }
+    let offset = (addr - GAMEPAK_ROM_START) & 0x01FF_FFFF;
+    if (GAMEPAK_GPIO_DATA_OFFSET..=GAMEPAK_GPIO_CNT_OFFSET + 1).contains(&offset) {
+        Some(offset)
+    } else {
+        None
+    }
+}
+
+fn rtc_transfer_len_for_reg(reg: u8) -> u8 {
+    match reg {
+        2 => 7,
+        3 => 3,
+        _ => 1,
     }
 }
 
