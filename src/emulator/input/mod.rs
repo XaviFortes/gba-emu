@@ -1,0 +1,6 @@
+pub mod input;
+
+pub use input::{
+    Input, BUTTON_A, BUTTON_B, BUTTON_DOWN, BUTTON_L, BUTTON_LEFT, BUTTON_R, BUTTON_RIGHT,
+    BUTTON_SELECT, BUTTON_START, BUTTON_UP,
+};

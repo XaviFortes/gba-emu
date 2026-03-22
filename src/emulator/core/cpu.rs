@@ -2710,7 +2710,7 @@ impl Default for Cpu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emulator::bus::{EWRAM_START, GAMEPAK_ROM_START};
+    use crate::emulator::core::bus::{EWRAM_START, GAMEPAK_ROM_START};
 
     #[test]
     fn cpu_defaults_to_rom_start() {

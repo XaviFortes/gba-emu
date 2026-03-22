@@ -1,16 +1,17 @@
-mod apu;
-mod bus;
-mod cpu;
+mod audio;
+mod core;
 mod input;
-mod ppu;
-mod timers;
+mod timing;
+mod video;
 
 use std::path::Path;
 
-pub use bus::Bus;
-pub use cpu::Cpu;
-pub use input::{BUTTON_A, BUTTON_B, BUTTON_DOWN, BUTTON_L, BUTTON_LEFT, BUTTON_R, BUTTON_RIGHT, BUTTON_SELECT, BUTTON_START, BUTTON_UP};
-pub use ppu::{SCREEN_HEIGHT, SCREEN_WIDTH};
+pub use core::{Bus, Cpu};
+pub use input::{
+    BUTTON_A, BUTTON_B, BUTTON_DOWN, BUTTON_L, BUTTON_LEFT, BUTTON_R, BUTTON_RIGHT,
+    BUTTON_SELECT, BUTTON_START, BUTTON_UP,
+};
+pub use video::{SCREEN_HEIGHT, SCREEN_WIDTH};
 
 const CYCLES_PER_FRAME: u32 = 280_896;
 
@@ -57,10 +58,10 @@ pub struct DebugSnapshot {
 pub struct Gba {
     pub bus: Bus,
     pub cpu: Cpu,
-    ppu: ppu::Ppu,
-    apu: apu::Apu,
+    ppu: video::Ppu,
+    apu: audio::Apu,
     input: input::Input,
-    timers: timers::Timers,
+    timers: timing::Timers,
     last_frame_bios_steps: u32,
     last_frame_rom_steps: u32,
     bios_stall_frame_count: u32,
@@ -72,10 +73,10 @@ impl Gba {
         Self {
             bus: Bus::new(),
             cpu: Cpu::new(),
-            ppu: ppu::Ppu::new(),
-            apu: apu::Apu::new(),
+            ppu: video::Ppu::new(),
+            apu: audio::Apu::new(),
             input: input::Input::new(),
-            timers: timers::Timers::new(),
+            timers: timing::Timers::new(),
             last_frame_bios_steps: 0,
             last_frame_rom_steps: 0,
             bios_stall_frame_count: 0,
@@ -138,7 +139,7 @@ impl Gba {
                 self.bus.write16(0x0300_22DC, self.bus.read16(0x0300_22DC) | 0x0001);
                 self.bus.write16(0x0300_22F8, self.bus.read16(0x0300_22F8) | 0x0001);
 
-                let iflags = self.bus.read_io16(bus::REG_IF);
+                let iflags = self.bus.read_io16(core::bus::REG_IF);
                 if iflags != 0 {
                     let irq_check = self.bus.read16(0x0300_22DC) | iflags | 0x0001;
                     self.bus.write16(0x0300_22DC, irq_check);
@@ -214,11 +215,11 @@ impl Gba {
             r7: self.cpu.read_reg(7),
             sp: self.cpu.read_reg(13),
             lr: self.cpu.read_reg(14),
-            dispcnt: self.bus.read_io16(bus::REG_DISPCNT),
-            vcount: self.bus.read_io16(bus::REG_VCOUNT),
-            ime: self.bus.read_io16(bus::REG_IME),
-            ie: self.bus.read_io16(bus::REG_IE),
-            iflags: self.bus.read_io16(bus::REG_IF),
+            dispcnt: self.bus.read_io16(core::bus::REG_DISPCNT),
+            vcount: self.bus.read_io16(core::bus::REG_VCOUNT),
+            ime: self.bus.read_io16(core::bus::REG_IME),
+            ie: self.bus.read_io16(core::bus::REG_IE),
+            iflags: self.bus.read_io16(core::bus::REG_IF),
             handoff_7ff0: self.bus.read8(0x0300_7FF0),
             bios_irq_flags: self.bus.read16(0x03FF_FFF8),
             irq_vec: self.bus.read32(0x03FF_FFFC),
@@ -242,7 +243,7 @@ impl Gba {
     }
 
     pub fn set_trace_branches(&mut self, enabled: bool) {
-        cpu::Cpu::set_trace_branches(enabled);
+        core::Cpu::set_trace_branches(enabled);
     }
 
     pub fn force_boot_to_rom_without_bios(&mut self) {

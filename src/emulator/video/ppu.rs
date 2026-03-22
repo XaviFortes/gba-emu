@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use super::bus::{
+use crate::emulator::core::bus::{
     Bus, IRQ_VBLANK, OAM_START, PALETTE_RAM_START, REG_DISPCNT, REG_DISPSTAT, REG_VCOUNT,
 };
 

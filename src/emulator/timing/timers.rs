@@ -1,4 +1,4 @@
-use super::bus::Bus;
+use crate::emulator::core::bus::Bus;
 
 #[derive(Debug, Default)]
 pub struct Timers;

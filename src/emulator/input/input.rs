@@ -1,4 +1,4 @@
-use super::bus::Bus;
+use crate::emulator::core::bus::Bus;
 
 pub const BUTTON_A: u16 = 1 << 0;
 pub const BUTTON_B: u16 = 1 << 1;

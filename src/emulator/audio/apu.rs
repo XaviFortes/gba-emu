@@ -1,10 +1,11 @@
-use super::bus::Bus;
+use crate::emulator::core::bus::Bus;
 
 #[cfg(feature = "audio")]
 mod backend {
     use rodio::{OutputStream, Sink, Source};
 
-    use super::super::input::BUTTON_A;
+    use crate::emulator::core::bus::REG_KEYINPUT;
+    use crate::emulator::input::BUTTON_A;
     use super::Bus;
 
     #[derive(Debug)]
@@ -36,7 +37,7 @@ mod backend {
         }
 
         pub fn tick(&mut self, bus: &Bus) {
-            let keyinput = bus.read_io16(super::super::bus::REG_KEYINPUT);
+            let keyinput = bus.read_io16(REG_KEYINPUT);
             let a_pressed = (keyinput & BUTTON_A) == 0;
 
             if let Some(sink) = &self.sink {
