@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -99,6 +100,8 @@ pub struct Bus {
     halt_requested: bool,
     flash_cmd_stage: u8,
     flash_id_mode: bool,
+    cpu_exec_pc: Cell<u32>,
+    bios_last_opcode: Cell<u32>,
 }
 
 impl Bus {
@@ -123,6 +126,9 @@ impl Bus {
             halt_requested: false,
             flash_cmd_stage: 0,
             flash_id_mode: false,
+            cpu_exec_pc: Cell::new(0),
+            // Hardware returns the last fetched BIOS opcode when BIOS is protected.
+            bios_last_opcode: Cell::new(0xE129_F000),
         };
         bus.write_io16_raw(REG_KEYINPUT, 0xFFFF);
         // Joybus idle state (no host attached) prevents BIOS link polling deadlocks.
@@ -190,6 +196,10 @@ impl Bus {
         self.bios_loaded = false;
     }
 
+    pub fn set_cpu_exec_pc(&self, pc: u32) {
+        self.cpu_exec_pc.set(pc);
+    }
+
     pub fn load_rom<P: AsRef<Path>>(&mut self, path: P) -> Result<(), std::io::Error> {
         self.rom = fs::read(path)?;
         Ok(())
@@ -201,7 +211,11 @@ impl Bus {
 
     pub fn read8(&self, addr: u32) -> u8 {
         if self.bios_loaded && (BIOS_START..BIOS_START + BIOS_SIZE as u32).contains(&addr) {
-            return self.bios[(addr - BIOS_START) as usize];
+            if self.cpu_exec_pc.get() < BIOS_SIZE as u32 {
+                return self.bios[(addr - BIOS_START) as usize];
+            }
+            let shift = (addr & 3) << 3;
+            return ((self.bios_last_opcode.get() >> shift) & 0xFF) as u8;
         }
 
         if (EWRAM_START..EWRAM_START + EWRAM_REGION_SIZE).contains(&addr) {
@@ -269,12 +283,33 @@ impl Bus {
     }
 
     pub fn read16(&self, addr: u32) -> u16 {
+        if self.bios_loaded && (BIOS_START..BIOS_START + BIOS_SIZE as u32).contains(&addr) {
+            if self.cpu_exec_pc.get() >= BIOS_SIZE as u32 {
+                let shift = (addr & 2) << 3;
+                return ((self.bios_last_opcode.get() >> shift) & 0xFFFF) as u16;
+            }
+        }
+
         let lo = self.read8(addr) as u16;
         let hi = self.read8(addr.wrapping_add(1)) as u16;
         lo | (hi << 8)
     }
 
     pub fn read32(&self, addr: u32) -> u32 {
+        if self.bios_loaded && (BIOS_START..BIOS_START + BIOS_SIZE as u32).contains(&addr) {
+            if self.cpu_exec_pc.get() < BIOS_SIZE as u32 {
+                let off = (addr - BIOS_START) as usize;
+                let b0 = *self.bios.get(off).unwrap_or(&0) as u32;
+                let b1 = *self.bios.get(off + 1).unwrap_or(&0) as u32;
+                let b2 = *self.bios.get(off + 2).unwrap_or(&0) as u32;
+                let b3 = *self.bios.get(off + 3).unwrap_or(&0) as u32;
+                let value = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+                self.bios_last_opcode.set(value);
+                return value;
+            }
+            return self.bios_last_opcode.get();
+        }
+
         let b0 = self.read8(addr) as u32;
         let b1 = self.read8(addr.wrapping_add(1)) as u32;
         let b2 = self.read8(addr.wrapping_add(2)) as u32;

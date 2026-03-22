@@ -218,6 +218,8 @@ impl Cpu {
     }
 
     pub fn step(&mut self, bus: &mut Bus) -> u32 {
+        bus.set_cpu_exec_pc(self.pc());
+
         if self.biosless_irq_active && (self.pc() & !1) == BIOSLESS_IRQ_RETURN_MAGIC {
             self.finish_biosless_irq_return();
             self.cycles += 1;
@@ -255,6 +257,7 @@ impl Cpu {
         }
 
         let pc = self.pc();
+        bus.set_cpu_exec_pc(pc);
         let thumb = self.is_thumb();
         let expected_next = if thumb {
             pc.wrapping_add(2)
@@ -322,7 +325,10 @@ impl Cpu {
             return false;
         }
 
-        if !bus.has_bios() && !biosless_irq_stub_enabled() {
+        if !bus.has_bios() {
+            if biosless_irq_stub_enabled() {
+                return self.handle_biosless_irq_callback(bus);
+            }
             return false;
         }
 
@@ -346,12 +352,6 @@ impl Cpu {
         // from 0x03FFFFF8. Mirror claimed IRQs here to avoid losing wake events.
         let bios_flags = bus.read16(0x03FF_FFF8) | mask;
         bus.write16(0x03FF_FFF8, bios_flags);
-
-        if !bus.has_bios() {
-            // In no-BIOS mode there is no BIOS handler to acknowledge IF;
-            // clear the claimed source before dispatching game callback.
-            bus.write_io16(super::bus::REG_IF, mask);
-        }
 
         self.spsr_irq = self.cpsr;
         self.switch_mode(CpuMode::Irq);
@@ -388,55 +388,8 @@ impl Cpu {
             );
         }
 
-        if bus.has_bios() {
-            // Standard ARM IRQ vector entry via BIOS.
-            self.set_pc(0x0000_0018);
-        } else {
-            // BIOS-less mode: emulate BIOS IRQ dispatcher stub at 0x00000018,
-            // which forwards to game-installed callback pointer at 0x03FFFFFC.
-            let handler = bus.read32(0x03FF_FFFC);
-            if !((0x0200_0000..0x0400_0000).contains(&handler)
-                || (0x0800_0000..0x0E00_0000).contains(&handler))
-            {
-                if trace_irq_flow_enabled() {
-                    println!(
-                        "[irq-flow] no valid callback handler=0x{:08X}; returning from IRQ",
-                        handler
-                    );
-                }
-                self.restore_cpsr_from_spsr();
-                let return_pc = self.regs[REG_LR].wrapping_sub(4);
-                if self.is_thumb() {
-                    self.set_pc(return_pc & !1);
-                } else {
-                    self.set_pc(return_pc & !3);
-                }
-                return true;
-            }
-
-            self.biosless_irq_active = true;
-            self.biosless_irq_saved[0] = self.regs[0];
-            self.biosless_irq_saved[1] = self.regs[1];
-            self.biosless_irq_saved[2] = self.regs[2];
-            self.biosless_irq_saved[3] = self.regs[3];
-            self.biosless_irq_saved[4] = self.regs[12];
-            self.biosless_irq_lr = self.regs[REG_LR];
-
-            // BIOS IRQ stub runs game callback in System mode (not IRQ mode).
-            self.switch_mode(CpuMode::System);
-            self.cpsr = (self.cpsr & 0xF000_0000) | CPSR_IRQ_DISABLE | CPSR_FIQ_DISABLE | 0x1F;
-
-            // BIOS callback calling convention passes IO base in r0.
-            self.regs[0] = 0x0400_0000;
-            self.regs[REG_LR] = BIOSLESS_IRQ_RETURN_MAGIC;
-            if (handler & 1) != 0 {
-                self.cpsr |= CPSR_THUMB;
-                self.set_pc(handler & !1);
-            } else {
-                self.cpsr &= !CPSR_THUMB;
-                self.set_pc(handler & !3);
-            }
-        }
+        // Standard ARM IRQ vector entry via BIOS.
+        self.set_pc(0x0000_0018);
 
         true
     }
@@ -459,9 +412,12 @@ impl Cpu {
             return false;
         }
 
-        let Some(_mask) = bus.claim_pending_interrupt() else {
+        let Some(mask) = bus.claim_pending_interrupt() else {
             return false;
         };
+
+        // Without BIOS vector code, acknowledge the claimed IF source here.
+        bus.write_io16(super::bus::REG_IF, mask);
 
         self.spsr_irq = self.cpsr;
         self.switch_mode(CpuMode::Irq);
