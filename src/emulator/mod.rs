@@ -5,6 +5,7 @@ mod timing;
 mod video;
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 pub use core::{Bus, Cpu};
 pub use input::{
@@ -125,6 +126,7 @@ impl Gba {
                 frame_rom_steps = frame_rom_steps.saturating_add(1);
             }
 
+            self.bus.tick_dma(spent);
             self.timers.tick(&mut self.bus, spent);
             self.ppu.tick(spent, &mut self.bus, render_video);
             self.input.tick(&mut self.bus);
@@ -160,7 +162,11 @@ impl Gba {
         // BIOS stall detection: if BIOS is stuck in a tight loop (no ROM execution),
         // force handoff to ROM after a reasonable timeout. Real BIOS always completes
         // initialization and hands off within ~60 frames; this detects runaway BIOS.
-        if self.bus.has_bios() && frame_rom_steps == 0 && frame_bios_steps > 100_000 {
+        if internal_bios_handoff_enabled()
+            && self.bus.has_bios()
+            && frame_rom_steps == 0
+            && frame_bios_steps > 100_000
+        {
             let pc = self.cpu.pc();
             if pc < 0x0000_4000 {
                 // BIOS is still executing. Check if it's stuck in same address
@@ -252,6 +258,15 @@ impl Gba {
         self.bus.disable_bios();
         self.cpu.jump_to_rom_entry();
     }
+}
+
+fn internal_bios_handoff_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("GBA_DISABLE_INTERNAL_BIOS_HANDOFF")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 impl Default for Gba {

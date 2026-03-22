@@ -97,6 +97,7 @@ pub struct Bus {
     oam: [u8; OAM_SIZE],
     rom: Vec<u8>,
     timers: [TimerState; 4],
+    dma_activation_delay: [u8; 4],
     halt_requested: bool,
     flash_cmd_stage: u8,
     flash_id_mode: bool,
@@ -123,6 +124,7 @@ impl Bus {
                 };
                 4
             ],
+            dma_activation_delay: [0; 4],
             halt_requested: false,
             flash_cmd_stage: 0,
             flash_id_mode: false,
@@ -161,6 +163,7 @@ impl Bus {
             };
             4
         ];
+        self.dma_activation_delay = [0; 4];
         self.halt_requested = false;
         self.flash_cmd_stage = 0;
         self.flash_id_mode = false;
@@ -724,6 +727,23 @@ impl Bus {
         }
     }
 
+    pub fn tick_dma(&mut self, cycles: u32) {
+        for channel in 0..4usize {
+            let delay = self.dma_activation_delay[channel];
+            if delay == 0 {
+                continue;
+            }
+
+            let step = cycles.min(u32::from(u8::MAX)) as u8;
+            if step >= delay {
+                self.dma_activation_delay[channel] = 0;
+                self.run_dma(channel);
+            } else {
+                self.dma_activation_delay[channel] = delay - step;
+            }
+        }
+    }
+
     fn handle_side_effects_16(&mut self, addr: u32, old_value: u16, value: u16) {
         if addr == REG_SIOCNT {
             // BIOS helper uses multiplayer+IRQ mode and waits on the serial IRQ path.
@@ -774,7 +794,8 @@ impl Bus {
             let newly_enabled = (value & (1 << 15)) != 0 && (old_value & (1 << 15)) == 0;
             let start_timing = (value >> 12) & 0b11;
             if newly_enabled && start_timing == 0 {
-                self.run_dma(channel);
+                // Hardware starts immediate DMA after a small activation delay.
+                self.dma_activation_delay[channel] = 3;
             }
             return;
         }

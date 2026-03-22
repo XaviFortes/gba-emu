@@ -221,7 +221,7 @@ impl Cpu {
         bus.set_cpu_exec_pc(self.pc());
 
         if self.biosless_irq_active && (self.pc() & !1) == BIOSLESS_IRQ_RETURN_MAGIC {
-            self.finish_biosless_irq_return();
+            self.finish_biosless_irq_return(bus);
             self.cycles += 1;
             return 1;
         }
@@ -426,24 +426,30 @@ impl Cpu {
         self.cpsr &= !CPSR_THUMB;
         self.cpsr |= CPSR_IRQ_DISABLE | CPSR_FIQ_DISABLE;
 
-        self.biosless_irq_active = true;
-        self.biosless_irq_saved[0] = self.regs[0];
-        self.biosless_irq_saved[1] = self.regs[1];
-        self.biosless_irq_saved[2] = self.regs[2];
-        self.biosless_irq_saved[3] = self.regs[3];
-        self.biosless_irq_saved[4] = self.regs[12];
-        self.biosless_irq_lr = self.regs[REG_LR];
+        // Emulate BIOS IRQ trampoline stack frame:
+        // stmfd r13!, {r0-r3,r12,r14}
+        let mut sp = self.regs[REG_SP].wrapping_sub(24);
+        bus.write32(sp, self.regs[0]);
+        sp = sp.wrapping_add(4);
+        bus.write32(sp, self.regs[1]);
+        sp = sp.wrapping_add(4);
+        bus.write32(sp, self.regs[2]);
+        sp = sp.wrapping_add(4);
+        bus.write32(sp, self.regs[3]);
+        sp = sp.wrapping_add(4);
+        bus.write32(sp, self.regs[12]);
+        sp = sp.wrapping_add(4);
+        bus.write32(sp, self.regs[REG_LR]);
+        self.regs[REG_SP] = self.regs[REG_SP].wrapping_sub(24);
 
-        // Match BIOS callback calling convention (r0 = IO base).
+        self.biosless_irq_active = true;
+
+        // Match BIOS callback convention: r0 = IO base.
         self.regs[0] = 0x0400_0000;
         self.regs[REG_LR] = BIOSLESS_IRQ_RETURN_MAGIC;
-        if (handler & 1) != 0 {
-            self.cpsr |= CPSR_THUMB;
-            self.set_pc(handler & !1);
-        } else {
-            self.cpsr &= !CPSR_THUMB;
-            self.set_pc(handler & !3);
-        }
+        // BIOS trampoline loads PC directly in ARM state.
+        self.cpsr &= !CPSR_THUMB;
+        self.set_pc(handler & !3);
 
         true
     }
@@ -2000,7 +2006,8 @@ impl Cpu {
 
     fn branch_exchange(&mut self, target: u32) {
         if self.biosless_irq_active && (target & !1) == BIOSLESS_IRQ_RETURN_MAGIC {
-            self.finish_biosless_irq_return();
+            // Defer special IRQ return handling to the step preamble.
+            self.set_pc(BIOSLESS_IRQ_RETURN_MAGIC);
             return;
         }
 
@@ -2410,6 +2417,10 @@ impl Cpu {
                     clear_region(bus, OAM_START, OAM_SIZE);
                 }
             }
+            0x02 => {
+                // Halt: stop CPU until an enabled interrupt becomes pending.
+                self.halted = true;
+            }
             0x04 => {
                 let ignore_existing = self.regs[0] != 0;
                 let irq_mask = self.regs[1] as u16;
@@ -2472,11 +2483,14 @@ impl Cpu {
     }
 
     fn hle_intr_wait(&mut self, bus: &mut Bus, ignore_existing: bool, irq_mask: u16) {
-        let mut pending = bus.read_io16(super::bus::REG_IF) & irq_mask;
+        // BIOS IntrWait/VBlankIntrWait consume the software IRQ mirror at 0x03FFFFF8.
+        let mut bios_flags = bus.read16(0x03FF_FFF8);
+        let mut pending = bios_flags & irq_mask;
 
         if ignore_existing {
             if pending != 0 {
-                bus.write_io16(super::bus::REG_IF, pending);
+                bios_flags &= !pending;
+                bus.write16(0x03FF_FFF8, bios_flags);
             }
             pending = 0;
         }
@@ -2484,7 +2498,8 @@ impl Cpu {
         if pending == 0 {
             self.halted = true;
         } else {
-            bus.write_io16(super::bus::REG_IF, pending);
+            bios_flags &= !pending;
+            bus.write16(0x03FF_FFF8, bios_flags);
         }
     }
 
@@ -2537,16 +2552,25 @@ impl Cpu {
 }
 
 impl Cpu {
-    fn finish_biosless_irq_return(&mut self) {
-        let return_pc = self.biosless_irq_lr.wrapping_sub(4);
+    fn finish_biosless_irq_return(&mut self, bus: &mut Bus) {
         self.biosless_irq_active = false;
 
-        self.regs[0] = self.biosless_irq_saved[0];
-        self.regs[1] = self.biosless_irq_saved[1];
-        self.regs[2] = self.biosless_irq_saved[2];
-        self.regs[3] = self.biosless_irq_saved[3];
-        self.regs[12] = self.biosless_irq_saved[4];
-        self.regs[REG_LR] = self.biosless_irq_lr;
+        // Emulate BIOS IRQ trampoline epilogue:
+        // ldmfd r13!, {r0-r3,r12,r14}
+        let mut sp = self.regs[REG_SP];
+        self.regs[0] = bus.read32(sp);
+        sp = sp.wrapping_add(4);
+        self.regs[1] = bus.read32(sp);
+        sp = sp.wrapping_add(4);
+        self.regs[2] = bus.read32(sp);
+        sp = sp.wrapping_add(4);
+        self.regs[3] = bus.read32(sp);
+        sp = sp.wrapping_add(4);
+        self.regs[12] = bus.read32(sp);
+        sp = sp.wrapping_add(4);
+        self.regs[REG_LR] = bus.read32(sp);
+        sp = sp.wrapping_add(4);
+        self.regs[REG_SP] = sp;
 
         // Return from IRQ exception using saved SPSR_irq regardless of current mode.
         let restored = sanitize_cpsr_mode_bits(self.spsr_irq, self.cpsr & 0x1F);
@@ -2557,6 +2581,7 @@ impl Cpu {
             self.switch_mode(new_mode);
         }
 
+        let return_pc = self.regs[REG_LR].wrapping_sub(4);
         if self.is_thumb() {
             self.set_pc(return_pc & !1);
         } else {
