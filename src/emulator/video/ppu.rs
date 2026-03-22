@@ -111,46 +111,88 @@ impl Ppu {
     fn render_scanline(&mut self, bus: &Bus, y: usize) {
         let dispcnt = bus.read_io16(REG_DISPCNT);
         let mode = dispcnt & 0b111;
+        let mut priority = [4u8; SCREEN_WIDTH];
+        let mut obj_owner = [false; SCREEN_WIDTH];
         match mode {
             0 => {
-                self.render_mode0_scanline(bus, y, dispcnt);
+                self.render_mode0_scanline(bus, y, dispcnt, &mut priority, &mut obj_owner);
             }
             1 => {
                 // Mode 1 has text BG0/BG1 plus affine BG2.
-                self.render_mode1_scanline(bus, y, dispcnt);
+                self.render_mode1_scanline(bus, y, dispcnt, &mut priority, &mut obj_owner);
             }
             2 => {
-                self.render_mode2_scanline(bus, y, dispcnt);
+                self.render_mode2_scanline(bus, y, dispcnt, &mut priority, &mut obj_owner);
             }
-            3 => self.render_mode3_scanline(bus, y),
-            4 => self.render_mode4_scanline(bus, y, dispcnt),
+            3 => self.render_mode3_scanline(bus, y, dispcnt, &mut priority, &mut obj_owner),
+            4 => self.render_mode4_scanline(bus, y, dispcnt, &mut priority, &mut obj_owner),
+            5 => self.render_mode5_scanline(bus, y, dispcnt, &mut priority, &mut obj_owner),
             _ => self.clear_scanline(y),
         }
 
         // Baseline OBJ pass (normal, non-affine sprites) for all visible modes.
         if (dispcnt & (1 << 12)) != 0 {
-            self.render_obj_scanline(bus, y, dispcnt);
+            self.render_obj_scanline(bus, y, dispcnt, &mut priority, &mut obj_owner);
         }
     }
 
-    fn render_mode4_scanline(&mut self, bus: &Bus, y: usize, dispcnt: u16) {
+    fn render_mode4_scanline(
+        &mut self,
+        bus: &Bus,
+        y: usize,
+        dispcnt: u16,
+        priority: &mut [u8; SCREEN_WIDTH],
+        obj_owner: &mut [bool; SCREEN_WIDTH],
+    ) {
         let row_start = y * SCREEN_WIDTH;
+        let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
+        for (i, px) in self.framebuffer[row_start..row_start + SCREEN_WIDTH]
+            .iter_mut()
+            .enumerate()
+        {
+            *px = backdrop;
+            priority[i] = 4;
+            obj_owner[i] = false;
+        }
+
+        if (dispcnt & (1 << 10)) == 0 {
+            return;
+        }
+
+        let bg_prio = (bus.read_io16(REG_BG2CNT) & 0b11) as u8;
         let frame_base = if (dispcnt & (1 << 4)) != 0 { 0xA000 } else { 0x0000 };
         let vram = bus.vram();
 
         for x in 0..SCREEN_WIDTH {
+            if bg_prio > priority[x] {
+                continue;
+            }
             let off = frame_base + row_start + x;
             let index = vram.get(off).copied().unwrap_or(0) as usize;
             let color = bus.read16(PALETTE_RAM_START + (index * 2) as u32);
             self.framebuffer[row_start + x] = bgr555_to_argb8888(color);
+            priority[x] = bg_prio;
+            obj_owner[x] = false;
         }
     }
 
-    fn render_mode2_scanline(&mut self, bus: &Bus, y: usize, dispcnt: u16) {
+    fn render_mode2_scanline(
+        &mut self,
+        bus: &Bus,
+        y: usize,
+        dispcnt: u16,
+        priority: &mut [u8; SCREEN_WIDTH],
+        obj_owner: &mut [bool; SCREEN_WIDTH],
+    ) {
         let row_start = y * SCREEN_WIDTH;
         let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
-        for px in &mut self.framebuffer[row_start..row_start + SCREEN_WIDTH] {
+        for (i, px) in self.framebuffer[row_start..row_start + SCREEN_WIDTH]
+            .iter_mut()
+            .enumerate()
+        {
             *px = backdrop;
+            priority[i] = 4;
+            obj_owner[i] = false;
         }
 
         let mut candidates: Vec<(u16, usize)> = Vec::new();
@@ -165,27 +207,114 @@ impl Ppu {
 
         candidates.sort_by_key(|(priority, _)| *priority);
 
-        for (_, bg) in candidates {
-            self.render_affine_bg_scanline(bus, y, bg);
+        for (prio, bg) in candidates {
+            self.render_affine_bg_scanline(bus, y, bg, prio as u8, priority, obj_owner);
         }
     }
 
-    fn render_mode3_scanline(&mut self, bus: &Bus, y: usize) {
+    fn render_mode3_scanline(
+        &mut self,
+        bus: &Bus,
+        y: usize,
+        dispcnt: u16,
+        priority: &mut [u8; SCREEN_WIDTH],
+        obj_owner: &mut [bool; SCREEN_WIDTH],
+    ) {
         let vram = bus.vram();
         let row_start = y * SCREEN_WIDTH;
+        let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
+        for (i, px) in self.framebuffer[row_start..row_start + SCREEN_WIDTH]
+            .iter_mut()
+            .enumerate()
+        {
+            *px = backdrop;
+            priority[i] = 4;
+            obj_owner[i] = false;
+        }
+
+        if (dispcnt & (1 << 10)) == 0 {
+            return;
+        }
+
+        let bg_prio = (bus.read_io16(REG_BG2CNT) & 0b11) as u8;
 
         for x in 0..SCREEN_WIDTH {
+            if bg_prio > priority[x] {
+                continue;
+            }
             let off = (row_start + x) * 2;
             let color = u16::from_le_bytes([vram[off], vram[off + 1]]);
             self.framebuffer[row_start + x] = bgr555_to_argb8888(color);
+            priority[x] = bg_prio;
+            obj_owner[x] = false;
         }
     }
 
-    fn render_mode0_scanline(&mut self, bus: &Bus, y: usize, dispcnt: u16) {
+    fn render_mode5_scanline(
+        &mut self,
+        bus: &Bus,
+        y: usize,
+        dispcnt: u16,
+        priority: &mut [u8; SCREEN_WIDTH],
+        obj_owner: &mut [bool; SCREEN_WIDTH],
+    ) {
         let row_start = y * SCREEN_WIDTH;
         let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
-        for px in &mut self.framebuffer[row_start..row_start + SCREEN_WIDTH] {
+        for (i, px) in self.framebuffer[row_start..row_start + SCREEN_WIDTH]
+            .iter_mut()
+            .enumerate()
+        {
             *px = backdrop;
+            priority[i] = 4;
+            obj_owner[i] = false;
+        }
+
+        if (dispcnt & (1 << 10)) == 0 {
+            return;
+        }
+
+        let bg_prio = (bus.read_io16(REG_BG2CNT) & 0b11) as u8;
+
+        // Mode 5 is a 160x128 16bpp bitmap in BG2 only.
+        if y >= 128 {
+            return;
+        }
+
+        let frame_base = if (dispcnt & (1 << 4)) != 0 { 0xA000 } else { 0x0000 };
+        let vram = bus.vram();
+
+        for x in 0..160usize {
+            if bg_prio > priority[x] {
+                continue;
+            }
+            let off = frame_base + ((y * 160 + x) * 2);
+            if off + 1 >= vram.len() {
+                continue;
+            }
+            let color = u16::from_le_bytes([vram[off], vram[off + 1]]);
+            self.framebuffer[row_start + x] = bgr555_to_argb8888(color);
+            priority[x] = bg_prio;
+            obj_owner[x] = false;
+        }
+    }
+
+    fn render_mode0_scanline(
+        &mut self,
+        bus: &Bus,
+        y: usize,
+        dispcnt: u16,
+        priority: &mut [u8; SCREEN_WIDTH],
+        obj_owner: &mut [bool; SCREEN_WIDTH],
+    ) {
+        let row_start = y * SCREEN_WIDTH;
+        let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
+        for (i, px) in self.framebuffer[row_start..row_start + SCREEN_WIDTH]
+            .iter_mut()
+            .enumerate()
+        {
+            *px = backdrop;
+            priority[i] = 4;
+            obj_owner[i] = false;
         }
 
         let mut candidates: Vec<(u16, usize)> = Vec::new();
@@ -200,16 +329,28 @@ impl Ppu {
 
         candidates.sort_by_key(|(priority, _)| *priority);
 
-        for (_, bg) in candidates {
-            self.render_text_bg_scanline(bus, y, bg);
+        for (prio, bg) in candidates {
+            self.render_text_bg_scanline(bus, y, bg, prio as u8, priority, obj_owner);
         }
     }
 
-    fn render_mode1_scanline(&mut self, bus: &Bus, y: usize, dispcnt: u16) {
+    fn render_mode1_scanline(
+        &mut self,
+        bus: &Bus,
+        y: usize,
+        dispcnt: u16,
+        priority: &mut [u8; SCREEN_WIDTH],
+        obj_owner: &mut [bool; SCREEN_WIDTH],
+    ) {
         let row_start = y * SCREEN_WIDTH;
         let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
-        for px in &mut self.framebuffer[row_start..row_start + SCREEN_WIDTH] {
+        for (i, px) in self.framebuffer[row_start..row_start + SCREEN_WIDTH]
+            .iter_mut()
+            .enumerate()
+        {
             *px = backdrop;
+            priority[i] = 4;
+            obj_owner[i] = false;
         }
 
         let mut candidates: Vec<(u16, usize)> = Vec::new();
@@ -222,14 +363,32 @@ impl Ppu {
             candidates.push((priority, bg));
         }
 
+        if (dispcnt & (1 << (8 + 2))) != 0 {
+            let cnt = bus.read_io16(bg_cnt_addr(2));
+            let priority = cnt & 0b11;
+            candidates.push((priority, 2));
+        }
+
         candidates.sort_by_key(|(priority, _)| *priority);
 
-        for (_, bg) in candidates {
-            self.render_text_bg_scanline(bus, y, bg);
+        for (prio, bg) in candidates {
+            if bg == 2 {
+                self.render_affine_bg_scanline(bus, y, 2, prio as u8, priority, obj_owner);
+            } else {
+                self.render_text_bg_scanline(bus, y, bg, prio as u8, priority, obj_owner);
+            }
         }
     }
 
-    fn render_affine_bg_scanline(&mut self, bus: &Bus, y: usize, bg: usize) {
+    fn render_affine_bg_scanline(
+        &mut self,
+        bus: &Bus,
+        y: usize,
+        bg: usize,
+        bg_prio: u8,
+        priority: &mut [u8; SCREEN_WIDTH],
+        obj_owner: &mut [bool; SCREEN_WIDTH],
+    ) {
         let (pa_addr, pb_addr, pc_addr, pd_addr, x_addr, y_addr) = match bg {
             2 => (REG_BG2PA, REG_BG2PB, REG_BG2PC, REG_BG2PD, REG_BG2X, REG_BG2Y),
             _ => (REG_BG3PA, REG_BG3PB, REG_BG3PC, REG_BG3PD, REG_BG3X, REG_BG3Y),
@@ -265,6 +424,12 @@ impl Ppu {
         let mut cur_y = ref_y + pd * y_i32;
 
         for x in 0..SCREEN_WIDTH {
+            if bg_prio > priority[x] {
+                cur_x = cur_x.wrapping_add(pa);
+                cur_y = cur_y.wrapping_add(pc);
+                continue;
+            }
+
             let src_x = cur_x >> 8;
             let src_y = cur_y >> 8;
 
@@ -306,10 +471,20 @@ impl Ppu {
 
             let color = bus.read16(PALETTE_RAM_START + (color_index * 2) as u32);
             self.framebuffer[row_start + x] = bgr555_to_argb8888(color);
+            priority[x] = bg_prio;
+            obj_owner[x] = false;
         }
     }
 
-    fn render_text_bg_scanline(&mut self, bus: &Bus, y: usize, bg: usize) {
+    fn render_text_bg_scanline(
+        &mut self,
+        bus: &Bus,
+        y: usize,
+        bg: usize,
+        bg_prio: u8,
+        priority: &mut [u8; SCREEN_WIDTH],
+        obj_owner: &mut [bool; SCREEN_WIDTH],
+    ) {
         let bgcnt = bus.read_io16(bg_cnt_addr(bg));
         let hofs = (bus.read_io16(bg_hofs_addr(bg)) & 0x1FF) as usize;
         let vofs = (bus.read_io16(bg_vofs_addr(bg)) & 0x1FF) as usize;
@@ -334,6 +509,9 @@ impl Ppu {
         let vram = bus.vram();
 
         for x in 0..SCREEN_WIDTH {
+            if bg_prio > priority[x] {
+                continue;
+            }
             let map_x = (map_x_base + x) % (width_tiles * 8);
             let tile_x = (map_x / 8) % width_tiles;
             let in_tile_x = map_x % 8;
@@ -386,6 +564,8 @@ impl Ppu {
 
             let color = bus.read16(PALETTE_RAM_START + (palette_index * 2) as u32);
             self.framebuffer[row_start + x] = bgr555_to_argb8888(color);
+            priority[x] = bg_prio;
+            obj_owner[x] = false;
         }
     }
 
@@ -397,7 +577,14 @@ impl Ppu {
         }
     }
 
-    fn render_obj_scanline(&mut self, bus: &Bus, y: usize, dispcnt: u16) {
+    fn render_obj_scanline(
+        &mut self,
+        bus: &Bus,
+        y: usize,
+        dispcnt: u16,
+        priority: &mut [u8; SCREEN_WIDTH],
+        obj_owner: &mut [bool; SCREEN_WIDTH],
+    ) {
         let one_dim_obj = (dispcnt & (1 << 6)) != 0;
         let vram = bus.vram();
         let row_start = y * SCREEN_WIDTH;
@@ -443,6 +630,7 @@ impl Ppu {
             }
 
             let tile_index = (attr2 & 0x03FF) as usize;
+            let obj_prio = ((attr2 >> 10) & 0x3) as u8;
             let palette_bank = ((attr2 >> 12) & 0xF) as usize;
             let hflip = (attr1 & (1 << 12)) != 0;
             let units_per_tile = if is_8bpp { 2usize } else { 1usize };
@@ -486,6 +674,13 @@ impl Ppu {
                     continue;
                 }
 
+                let px = screen_x as usize;
+                let can_draw = obj_prio < priority[px]
+                    || (obj_prio == priority[px] && !obj_owner[px]);
+                if !can_draw {
+                    continue;
+                }
+
                 let palette_index = if is_8bpp {
                     0x100 + color_index
                 } else {
@@ -493,7 +688,9 @@ impl Ppu {
                 };
                 let color = bus.read16(PALETTE_RAM_START + (palette_index * 2) as u32);
 
-                self.framebuffer[row_start + screen_x as usize] = bgr555_to_argb8888(color);
+                self.framebuffer[row_start + px] = bgr555_to_argb8888(color);
+                priority[px] = obj_prio;
+                obj_owner[px] = true;
             }
         }
     }
