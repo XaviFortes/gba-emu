@@ -252,7 +252,10 @@ impl Gba {
             return;
         }
 
-        println!("[boot] disabling BIOS mapping and jumping to ROM entry");
+        println!("[boot] disabling BIOS mapping and entering skip-BIOS boot state");
+
+        // rustboyadvance-ng style no-BIOS boot: start from a clean hardware state.
+        self.bus.reset_for_rom_boot();
 
         // Initialize BIOS-less IRQ callback contract region in mirrored IWRAM.
         self.bus.write16(0x03FF_FFF8, 0);
@@ -260,8 +263,19 @@ impl Gba {
         self.bus.write16(0x0300_22DC, 0);
         self.bus.write16(0x0300_22F8, 0);
 
+        // Emulate BIOS post-boot IO defaults expected by games.
+        self.bus.write16(0x0400_0300, 1); // POSTFLG
+        self.bus.write16(0x0400_0020, 0x0100); // BG2PA
+        self.bus.write16(0x0400_0022, 0x0000); // BG2PB
+        self.bus.write16(0x0400_0024, 0x0000); // BG2PC
+        self.bus.write16(0x0400_0026, 0x0100); // BG2PD
+        self.bus.write16(0x0400_0030, 0x0100); // BG3PA
+        self.bus.write16(0x0400_0032, 0x0000); // BG3PB
+        self.bus.write16(0x0400_0034, 0x0000); // BG3PC
+        self.bus.write16(0x0400_0036, 0x0100); // BG3PD
+
         self.bus.disable_bios();
-        self.cpu.jump_to_rom_entry();
+        self.cpu.force_boot_to_rom();
     }
 }
 
