@@ -3,13 +3,16 @@ use std::process::ExitCode;
 
 #[derive(Debug, Clone)]
 pub struct CliArgs {
-    pub rom_path: String,
+    pub rom_path: Option<String>,
     pub bios_path: Option<String>,
     pub frames: Option<u32>,
     pub debug_interval: Option<u32>,
     pub stuck_threshold: Option<u32>,
     pub bios_watchdog: Option<u32>,
     pub trace_branches: bool,
+    pub launcher: bool,
+    pub roms_dir: Option<String>,
+    pub window_scale: Option<u32>,
 }
 
 fn parse_u32_arg(bin: &str, args: &mut env::Args, flag: &str) -> Result<u32, ExitCode> {
@@ -31,7 +34,7 @@ fn parse_u32_arg(bin: &str, args: &mut env::Args, flag: &str) -> Result<u32, Exi
 
 pub fn print_usage(bin: &str) {
     eprintln!(
-        "Usage: {bin} --rom <path> [--bios <path>] [--frames <n>] [--debug-interval <frames>] [--stuck-threshold <frames>] [--bios-watchdog <frames>] [--trace-branches]"
+        "Usage: {bin} [--rom <path>] [--bios <path>] [--frames <n>] [--debug-interval <frames>] [--stuck-threshold <frames>] [--bios-watchdog <frames>] [--trace-branches] [--launcher] [--roms-dir <dir>] [--scale <2..6>]"
     );
 }
 
@@ -46,6 +49,9 @@ pub fn parse_args() -> Result<CliArgs, ExitCode> {
     let mut stuck_threshold: Option<u32> = None;
     let mut bios_watchdog: Option<u32> = None;
     let mut trace_branches = false;
+    let mut launcher = false;
+    let mut roms_dir: Option<String> = None;
+    let mut window_scale: Option<u32> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -78,6 +84,26 @@ pub fn parse_args() -> Result<CliArgs, ExitCode> {
             "--trace-branches" => {
                 trace_branches = true;
             }
+            "--launcher" => {
+                launcher = true;
+            }
+            "--roms-dir" => {
+                roms_dir = args.next();
+                if roms_dir.is_none() {
+                    eprintln!("Missing value for --roms-dir");
+                    print_usage(&bin);
+                    return Err(ExitCode::from(2));
+                }
+            }
+            "--scale" => {
+                let scale = parse_u32_arg(&bin, &mut args, "--scale")?;
+                if !(1..=6).contains(&scale) {
+                    eprintln!("Invalid --scale value: {scale}. Expected range 1..=6");
+                    print_usage(&bin);
+                    return Err(ExitCode::from(2));
+                }
+                window_scale = Some(scale);
+            }
             "-h" | "--help" => {
                 print_usage(&bin);
                 return Err(ExitCode::SUCCESS);
@@ -90,10 +116,9 @@ pub fn parse_args() -> Result<CliArgs, ExitCode> {
         }
     }
 
-    let Some(rom_path) = rom_path else {
-        print_usage(&bin);
-        return Err(ExitCode::from(2));
-    };
+    if rom_path.is_none() {
+        launcher = true;
+    }
 
     Ok(CliArgs {
         rom_path,
@@ -103,5 +128,8 @@ pub fn parse_args() -> Result<CliArgs, ExitCode> {
         stuck_threshold,
         bios_watchdog,
         trace_branches,
+        launcher,
+        roms_dir,
+        window_scale,
     })
 }

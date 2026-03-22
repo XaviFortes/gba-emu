@@ -8,6 +8,27 @@ A Game Boy Advance emulator prototype written in Rust.
 - Linux/macOS/Windows
 - Optional audio backend dependencies only if you enable `audio` feature
 
+### Audio Prerequisites (Linux)
+
+If you build with `--features audio`, install ALSA development headers first:
+
+```bash
+sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+```
+
+Fedora equivalent:
+
+```bash
+sudo dnf install -y alsa-lib-devel pkgconf-pkg-config
+```
+
+PipeWire note:
+
+- Even on PipeWire-based desktops, this backend typically goes through ALSA compatibility.
+- You still need `libasound2-dev` to compile.
+- At runtime, audio is usually routed to PipeWire automatically when PipeWire ALSA/Pulse compatibility is installed.
+- If needed, install PipeWire compatibility packages for your distro.
+
 ## Build
 
 ```bash
@@ -22,7 +43,13 @@ cargo build --release
 
 ## Run Commands
 
-Windowed mode (default):
+Launcher mode (default when no ROM is passed):
+
+```bash
+cargo run --release --
+```
+
+Windowed mode with direct ROM boot:
 
 ```bash
 cargo run -- --rom <path-to-rom.gba>
@@ -38,6 +65,18 @@ Windowed mode with BIOS:
 
 ```bash
 cargo run -- --rom <path-to-rom.gba> --bios <path-to-bios.bin>
+```
+
+Open launcher explicitly (Switch-style game browser):
+
+```bash
+cargo run -- --launcher
+```
+
+Open launcher with a custom ROM library directory:
+
+```bash
+cargo run -- --launcher --roms-dir ./roms
 ```
 
 Headless mode for N frames:
@@ -64,10 +103,19 @@ Enable audio feature:
 cargo run --features audio -- --rom <path-to-rom.gba>
 ```
 
+Enable audio feature in release mode:
+
+```bash
+cargo run --release --features audio -- --rom <path-to-rom.gba>
+```
+
 ## CLI Parameters
 
-- `--rom <path>`: Required. ROM file to load.
+- `--rom <path>`: Optional. ROM file to load directly (skips launcher).
 - `--bios <path>`: Optional BIOS file.
+- `--launcher`: Force launcher UI mode.
+- `--roms-dir <dir>`: Directory scanned for `.gba` files in launcher mode.
+- `--scale <1..6>`: Window scale preset (`1=X1`, `2=X2`, `3=X4`, `4=X8`, `5=X16`, `6=X32`).
 - `--frames <N>`: Run headless for exactly `N` frames.
 - `--debug-interval <frames>`: Print full debug snapshot every N frames.
 - `--stuck-threshold <frames>`: Emit warning when PC stays unchanged for N frames.
@@ -85,6 +133,21 @@ cargo run --features audio -- --rom <path-to-rom.gba>
 - `A`: L
 - `S`: R
 - `Esc`: Exit
+
+## Launcher Controls
+
+- `Left` / `Right`: Select game card
+- `Up` / `Down`: Select a setting row
+- `A` / `D`: Change setting value
+- `R`: Rescan ROM directory
+- `Enter`: Launch selected game
+- `Esc`: Exit launcher
+
+Launcher settings currently include:
+
+- Window scale preset
+- BIOS on/off toggle (auto-detected from `--bios` or `gba_bios.bin`)
+- Audio output mode (`Default` / `Muted` UI toggle)
 
 ## Project Structure
 

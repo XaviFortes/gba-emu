@@ -143,7 +143,7 @@ impl Gba {
                 }
             }
 
-            self.apu.tick(&self.bus);
+            self.apu.tick(&self.bus, spent);
             cycles += spent;
         }
 
@@ -242,6 +242,10 @@ impl Gba {
 
     pub fn set_trace_branches(&mut self, enabled: bool) {
         core::Cpu::set_trace_branches(enabled);
+    }
+
+    pub fn set_audio_muted(&mut self, muted: bool) {
+        self.apu.set_muted(muted);
     }
 
     pub fn force_boot_to_rom_without_bios(&mut self) {
