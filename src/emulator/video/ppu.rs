@@ -768,10 +768,8 @@ impl Ppu {
             };
 
             let obj_y = attr0 & 0x00FF;
-            let mut obj_x = attr1 & 0x01FF;
-            if obj_x >= 240 {
-                obj_x = obj_x.wrapping_sub(512);
-            }
+            let obj_x_raw = attr1 & 0x01FF;
+            let obj_x = (obj_x_raw as i16) as i32;
 
             let draw_width = if affine_double { width * 2 } else { width };
             let draw_height = if affine_double { height * 2 } else { height };
@@ -802,7 +800,7 @@ impl Ppu {
             let y_in_draw = y_u16.wrapping_sub(obj_y) as usize;
 
             for sx in 0..draw_width {
-                let screen_x = (obj_x as i32) + (sx as i32);
+                let screen_x = obj_x + (sx as i32);
                 if !(0..SCREEN_WIDTH as i32).contains(&screen_x) {
                     continue;
                 }
