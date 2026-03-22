@@ -450,10 +450,6 @@ impl Cpu {
     }
 
     fn exec_arm(&mut self, bus: &mut Bus, instr: u32) -> u32 {
-        if is_armv5te_only_arm_opcode(instr) {
-            return self.unknown_arm(instr);
-        }
-
         let cond = ((instr >> 28) & 0xF) as u8;
         if !self.condition_passed(cond) {
             return 1;
@@ -465,6 +461,76 @@ impl Cpu {
             let rm = (instr & 0xF) as usize;
             self.branch_exchange(self.regs[rm]);
             return 3;
+        }
+
+        // BLX Rm -- ARMv5T+: branch with link and exchange to address in register
+        // Encoding: cond 0001 0010 1111 1111 1111 0011 Rm
+        if (instr & 0x0FFF_FFF0) == 0x012F_FF30 {
+            let rm = (instr & 0xF) as usize;
+            // LR = address of next instruction (PC already advanced by 4)
+            self.regs[REG_LR] = self.pc();
+            self.branch_exchange(self.regs[rm]);
+            return 3;
+        }
+
+        // CLZ Rd, Rm -- ARMv5+: count leading zeros
+        // Encoding: cond 0001 0110 1111 Rd 1111 0001 Rm
+        if (instr & 0x0FFF_0FF0) == 0x016F_0F10 {
+            let rd = ((instr >> 12) & 0xF) as usize;
+            let rm = (instr & 0xF) as usize;
+            self.regs[rd] = self.regs[rm].leading_zeros();
+            return 1;
+        }
+
+        // QADD/QSUB/QDADD/QDSUB -- ARMv5TE+: saturating arithmetic
+        // Encoding: cond 0001 0xx0 Rn Rd 0000 0101 Rm
+        if (instr & 0x0F90_00F0) == 0x0100_0050 {
+            let op = (instr >> 21) & 0x3; // bits 22:21
+            let rn = ((instr >> 16) & 0xF) as usize;
+            let rd = ((instr >> 12) & 0xF) as usize;
+            let rm = (instr & 0xF) as usize;
+            let rm_val = self.regs[rm] as i32;
+            let rn_val = self.regs[rn] as i32;
+            let (result, saturated) = match op {
+                0b00 => {
+                    // QADD: Rd = sat(Rm + Rn)
+                    let (v, ov) = rm_val.overflowing_add(rn_val);
+                    if ov { (if rm_val >= 0 { i32::MAX } else { i32::MIN }, true) } else { (v, false) }
+                }
+                0b01 => {
+                    // QSUB: Rd = sat(Rm - Rn)
+                    let (v, ov) = rm_val.overflowing_sub(rn_val);
+                    if ov { (if rm_val >= 0 { i32::MAX } else { i32::MIN }, true) } else { (v, false) }
+                }
+                0b10 => {
+                    // QDADD: Rd = sat(Rm + sat(2*Rn))
+                    let (rn2, ov1) = rn_val.overflowing_mul(2);
+                    let rn2_sat = if ov1 { if rn_val >= 0 { i32::MAX } else { i32::MIN } } else { rn2 };
+                    let (v, ov2) = rm_val.overflowing_add(rn2_sat);
+                    if ov2 { (if rm_val >= 0 { i32::MAX } else { i32::MIN }, true) } else { (v, ov1) }
+                }
+                0b11 | _ => {
+                    // QDSUB: Rd = sat(Rm - sat(2*Rn))
+                    let (rn2, ov1) = rn_val.overflowing_mul(2);
+                    let rn2_sat = if ov1 { if rn_val >= 0 { i32::MAX } else { i32::MIN } } else { rn2 };
+                    let (v, ov2) = rm_val.overflowing_sub(rn2_sat);
+                    if ov2 { (if rm_val >= 0 { i32::MAX } else { i32::MIN }, true) } else { (v, ov1) }
+                }
+            };
+            self.regs[rd] = result as u32;
+            if saturated {
+                // Set the Q (sticky saturation) flag in CPSR bit 27
+                self.cpsr |= 1 << 27;
+            }
+            return 1;
+        }
+
+        // BKPT -- ARMv5+: software breakpoint
+        // Encoding: cond 0001 0010 xxxx xxxx xxxx 0111 xxxx
+        if (instr & 0x0FF0_00F0) == 0x0120_0070 {
+            // On real hardware this triggers a Prefetch Abort. In our emulator
+            // treat it as a no-op (or panic in strict mode).
+            return self.unknown_arm(instr);
         }
 
         // MRS Rd, CPSR
@@ -2501,29 +2567,7 @@ fn strict_unknown_enabled() -> bool {
     })
 }
 
-fn is_armv5te_only_arm_opcode(instr: u32) -> bool {
-    // BLX (register) -- ARMv5T+
-    if (instr & 0x0FFF_FFF0) == 0x012F_FF30 {
-        return true;
-    }
 
-    // CLZ -- ARMv5+
-    if (instr & 0x0FFF_0FF0) == 0x016F_0F10 {
-        return true;
-    }
-
-    // QADD/QSUB/QDADD/QDSUB -- ARMv5TE+
-    if (instr & 0x0F90_00F0) == 0x0100_0050 {
-        return true;
-    }
-
-    // BKPT -- ARMv5+
-    if (instr & 0x0FF0_00F0) == 0x0120_0070 {
-        return true;
-    }
-
-    false
-}
 
 fn trace_msr_enabled() -> bool {
     static TRACE: OnceLock<bool> = OnceLock::new();
