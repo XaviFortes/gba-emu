@@ -188,7 +188,7 @@ impl Cpu {
         self.reset();
         self.cycles = saved_cycles;
 
-        self.cpsr = 0x0000_001F;
+        self.cpsr = CPSR_IRQ_DISABLE | CPSR_FIQ_DISABLE | 0x0000_001F;
         self.mode = CpuMode::System;
         self.regs[0] = GAMEPAK_ROM_START;
         self.regs[1] = 0;
@@ -222,7 +222,8 @@ impl Cpu {
         self.spsr_und = 0;
 
         self.switch_mode(CpuMode::System);
-        self.cpsr = (self.cpsr & 0xF000_0000) | 0x0000_001F;
+        self.cpsr =
+            (self.cpsr & 0xF000_0000) | CPSR_IRQ_DISABLE | CPSR_FIQ_DISABLE | 0x0000_001F;
         self.regs[0] = GAMEPAK_ROM_START;
         self.regs[1] = 0;
         self.regs[2] = 0;
@@ -256,12 +257,8 @@ impl Cpu {
 
         if self.halted {
             if !bus.has_bios() && bus.has_pending_interrupts() {
-                // No BIOS path: SWI IntrWait/Halt should still resume when IF/IE/IME match,
-                // even if we are not entering the BIOS IRQ exception vector.
-                if let Some(mask) = bus.claim_pending_interrupt() {
-                    // Consume one pending source on wake to mimic BIOS IntrWait behavior.
-                    bus.write_io16(super::bus::REG_IF, mask);
-                }
+                // HALT wakeup in no-BIOS mode is level-triggered by IE&IF&IME.
+                // Do not consume IF here; callback/handler path owns acknowledgement.
                 self.halted = false;
                 self.cycles += 1;
                 return 1;
@@ -350,7 +347,7 @@ impl Cpu {
         }
 
         if !bus.has_bios() {
-            if biosless_irq_stub_enabled() {
+            if biosless_irq_callback_enabled() {
                 return self.handle_biosless_irq_callback(bus);
             }
             return false;
@@ -422,6 +419,9 @@ impl Cpu {
         if bus.has_bios() {
             return false;
         }
+        if self.biosless_irq_active {
+            return false;
+        }
         if (self.cpsr & CPSR_IRQ_DISABLE) != 0 {
             return false;
         }
@@ -448,24 +448,17 @@ impl Cpu {
         self.cpsr &= !CPSR_THUMB;
         self.cpsr |= CPSR_IRQ_DISABLE | CPSR_FIQ_DISABLE;
 
-        // Emulate BIOS IRQ trampoline save frame (vector 0x18):
-        // stmfd sp!, {r12,lr}; mrs r12,spsr; mrs lr,cpsr; stmfd sp!, {r12,lr}
-        let saved_r12 = self.regs[12];
-        let saved_lr = self.regs[REG_LR];
-        let saved_spsr = self.spsr_irq;
-        let saved_cpsr = self.cpsr;
-
-        let mut sp = self.regs[REG_SP].wrapping_sub(16);
-        bus.write32(sp, saved_r12);
-        sp = sp.wrapping_add(4);
-        bus.write32(sp, saved_lr);
-        sp = sp.wrapping_add(4);
-        bus.write32(sp, saved_spsr);
-        sp = sp.wrapping_add(4);
-        bus.write32(sp, saved_cpsr);
-        self.biosless_irq_frame_sp = self.regs[REG_SP].wrapping_sub(16);
-        self.regs[REG_SP] = self.regs[REG_SP].wrapping_sub(16);
-
+        // Direct no-BIOS callback contract:
+        // save volatile regs as BIOS IntrMain does, run callback, then emulate
+        // exception return (SUBS PC, LR, #4).
+        self.biosless_irq_saved[0] = self.regs[0];
+        self.biosless_irq_saved[1] = self.regs[1];
+        self.biosless_irq_saved[2] = self.regs[2];
+        self.biosless_irq_saved[3] = self.regs[3];
+        self.biosless_irq_saved[4] = self.regs[12];
+        self.biosless_irq_lr = self.regs[REG_LR];
+        // Keep an immutable copy of pre-IRQ CPSR; callback code may touch SPSR_irq.
+        self.biosless_irq_frame_sp = self.spsr_irq;
         self.biosless_irq_active = true;
 
         // Match BIOS callback convention: r0 = IO base.
@@ -2579,26 +2572,17 @@ impl Cpu {
     fn finish_biosless_irq_return(&mut self, bus: &mut Bus) {
         self.biosless_irq_active = false;
 
-        // Emulate BIOS IRQ trampoline epilogue:
-        // ldmfd sp!, {r12,lr}; msr spsr, r12; ldmfd sp!, {r12,lr}; subs pc,lr,#4
-        // BIOS reloads IRQ SP from a fixed location before epilogue.
-        let mut sp = self.biosless_irq_frame_sp;
-        let saved_r12 = bus.read32(sp);
-        sp = sp.wrapping_add(4);
-        let saved_lr = bus.read32(sp);
-        sp = sp.wrapping_add(4);
-        let saved_spsr = bus.read32(sp);
-        sp = sp.wrapping_add(4);
-        let _saved_cpsr = bus.read32(sp);
-        sp = sp.wrapping_add(4);
-        self.regs[REG_SP] = sp;
+        let _ = bus;
+        self.regs[0] = self.biosless_irq_saved[0];
+        self.regs[1] = self.biosless_irq_saved[1];
+        self.regs[2] = self.biosless_irq_saved[2];
+        self.regs[3] = self.biosless_irq_saved[3];
+        self.regs[12] = self.biosless_irq_saved[4];
+        self.regs[REG_LR] = self.biosless_irq_lr;
 
-        self.regs[12] = saved_r12;
-        self.regs[REG_LR] = saved_lr;
-        self.spsr_irq = saved_spsr;
-
-        // Return from IRQ exception using saved SPSR_irq regardless of current mode.
-        let restored = sanitize_cpsr_mode_bits(self.spsr_irq, self.cpsr & 0x1F);
+        // Emulate IRQ exception return semantics (SUBS PC, LR, #4).
+        let return_pc = self.regs[REG_LR].wrapping_sub(4);
+        let restored = sanitize_cpsr_mode_bits(self.biosless_irq_frame_sp, self.cpsr & 0x1F);
         let old_mode = self.mode;
         let new_mode = mode_from_cpsr(restored);
         self.cpsr = restored;
@@ -2606,12 +2590,7 @@ impl Cpu {
             self.switch_mode(new_mode);
         }
 
-        let return_pc = self.regs[REG_LR].wrapping_sub(4);
-        if self.is_thumb() {
-            self.set_pc(return_pc & !1);
-        } else {
-            self.set_pc(return_pc & !3);
-        }
+        self.set_pc(return_pc & !1);
 
         if trace_irq_flow_enabled() {
             println!(
@@ -2665,10 +2644,10 @@ fn trace_irq_flow_enabled() -> bool {
     })
 }
 
-fn biosless_irq_stub_enabled() -> bool {
+fn biosless_irq_callback_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("GBA_ENABLE_BIOSLESS_IRQ_STUB")
+        !std::env::var("GBA_DISABLE_BIOSLESS_IRQ_CALLBACK")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })

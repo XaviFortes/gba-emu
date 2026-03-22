@@ -135,10 +135,10 @@ impl Gba {
                 // Mirror pending IF sources into software IRQ-check words.
                 let iflags = self.bus.read_io16(core::bus::REG_IF);
                 if iflags != 0 {
-                    let irq_check = self.bus.read16(0x0300_22DC) | iflags | 0x0001;
+                    let irq_check = self.bus.read16(0x0300_22DC) | iflags;
                     self.bus.write16(0x0300_22DC, irq_check);
 
-                    let irq_check_alt = self.bus.read16(0x0300_22F8) | iflags | 0x0001;
+                    let irq_check_alt = self.bus.read16(0x0300_22F8) | iflags;
                     self.bus.write16(0x0300_22F8, irq_check_alt);
                 }
             }

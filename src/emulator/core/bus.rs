@@ -670,13 +670,13 @@ impl Bus {
             // halfword normally maintained by their installed IRQ callback.
             // Mirror pending IRQ bits into that location so wait loops can progress.
             let mut irq_check = self.read16(0x0300_22DC);
-            irq_check |= irq_mask | 0x0001;
+            irq_check |= irq_mask;
             self.write16(0x0300_22DC, irq_check);
 
             // Pokemon Emerald startup also polls 0x030022F8 and requires bit0 as
-            // a generic wake flag in addition to specific IRQ mask bits.
+            // an alternate IRQ mirror location in addition to 0x030022DC.
             let mut irq_check_alt = self.read16(0x0300_22F8);
-            irq_check_alt |= irq_mask | 0x0001;
+            irq_check_alt |= irq_mask;
             self.write16(0x0300_22F8, irq_check_alt);
         }
     }
