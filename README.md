@@ -28,6 +28,12 @@ Windowed mode (default):
 cargo run -- --rom <path-to-rom.gba>
 ```
 
+For best performance (recommended for real gameplay), use release mode:
+
+```bash
+cargo run --release -- --rom <path-to-rom.gba>
+```
+
 Windowed mode with BIOS:
 
 ```bash

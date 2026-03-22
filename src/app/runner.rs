@@ -179,6 +179,9 @@ fn boot_system(gba: &mut Gba, args: &CliArgs) -> Result<(), ExitCode> {
 pub fn run(args: CliArgs) -> ExitCode {
     let mut gba = Gba::new();
 
+    #[cfg(debug_assertions)]
+    println!("[perf] debug build detected; use `cargo run --release -- ...` for near real-time emulation");
+
     if let Err(code) = boot_system(&mut gba, &args) {
         return code;
     }

@@ -197,7 +197,7 @@ impl Bus {
     }
 
     pub fn read8(&self, addr: u32) -> u8 {
-        if (BIOS_START..BIOS_START + BIOS_SIZE as u32).contains(&addr) {
+        if self.bios_loaded && (BIOS_START..BIOS_START + BIOS_SIZE as u32).contains(&addr) {
             return self.bios[(addr - BIOS_START) as usize];
         }
 
@@ -560,6 +560,11 @@ impl Bus {
         }
 
         if !self.bios_loaded {
+            // Many games (including Pokemon) still poll BIOS IRQ flag mirrors in
+            // IWRAM after no-BIOS handoff. Keep this synchronized with pending IRQs.
+            let bios_irq_flags = self.read16(0x03FF_FFF8) | irq_mask;
+            self.write16(0x03FF_FFF8, bios_irq_flags);
+
             // No-BIOS compatibility: many commercial games rely on a RAM IRQ-check
             // halfword normally maintained by their installed IRQ callback.
             // Mirror pending IRQ bits into that location so wait loops can progress.

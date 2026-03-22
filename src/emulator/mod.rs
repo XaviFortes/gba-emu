@@ -14,6 +14,7 @@ pub use input::{
 pub use video::{SCREEN_HEIGHT, SCREEN_WIDTH};
 
 const CYCLES_PER_FRAME: u32 = 280_896;
+const BIOS_STALL_HANDOFF_FRAMES: u32 = 20;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DebugSnapshot {
@@ -166,9 +167,9 @@ impl Gba {
                 // (executes the same few instructions repeatedly in a loop).
                 if pc == self.last_bios_pc {
                     self.bios_stall_frame_count += 1;
-                    // Force handoff if stuck for 60+ frames at same PC (genuine deadlock).
-                    // Normal BIOS handoff happens much faster (~12 frames), so 60 is a clear timeout.
-                    if self.bios_stall_frame_count >= 60 {
+                    // Force handoff if stuck at the same BIOS PC for long enough.
+                    // 20 frames is conservative and avoids very long debug-build startup delays.
+                    if self.bios_stall_frame_count >= BIOS_STALL_HANDOFF_FRAMES {
                         // BIOS has completed hardware initialization and doesn't proceed further.
                         // This is normal - BIOS hands off to ROM when initialization is complete.
                         // Only log if verbosity is enabled; this is expected behavior, not a bug.
