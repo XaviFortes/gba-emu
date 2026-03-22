@@ -33,6 +33,9 @@ const GAMEPAK_SRAM_END: u32 = 0x0E01_0000;
 pub const REG_DISPCNT: u32 = IO_START + 0x000;
 pub const REG_DISPSTAT: u32 = IO_START + 0x004;
 pub const REG_VCOUNT: u32 = IO_START + 0x006;
+const REG_BG0CNT: u32 = IO_START + 0x008;
+const REG_BG0HOFS: u32 = IO_START + 0x010;
+const REG_BG0VOFS: u32 = IO_START + 0x012;
 pub const REG_KEYINPUT: u32 = IO_START + 0x130;
 const REG_SIODATA32_L: u32 = IO_START + 0x120;
 const REG_SIODATA32_H: u32 = IO_START + 0x122;
@@ -303,6 +306,30 @@ impl Bus {
             println!("[bios-bus] write8 addr=0x{:08X} value=0x{:02X}", addr, value);
         }
 
+        if trace_irq_flow_enabled()
+            && (addr == REG_IME
+                || addr == REG_IME + 1
+                || addr == REG_IE
+                || addr == REG_IE + 1
+                || addr == REG_IF
+                || addr == REG_IF + 1
+                || addr == 0x0300_22DC
+                || addr == 0x0300_22DD
+                || addr == 0x0300_22F8
+                || addr == 0x0300_22F9)
+        {
+            println!(
+                "[irq-flow] write8 addr=0x{:08X} value=0x{:02X} ime=0x{:04X} ie=0x{:04X} if=0x{:04X} chk=0x{:04X} chk_alt=0x{:04X}",
+                addr,
+                value,
+                self.read_io16_raw(REG_IME),
+                self.read_io16_raw(REG_IE),
+                self.read_io16_raw(REG_IF),
+                self.read16(0x0300_22DC),
+                self.read16(0x0300_22F8)
+            );
+        }
+
         if (EWRAM_START..EWRAM_START + EWRAM_REGION_SIZE).contains(&addr) {
             let off = ((addr - EWRAM_START) as usize) % EWRAM_SIZE;
             self.ewram[off] = value;
@@ -428,6 +455,29 @@ impl Bus {
 
         if trace_video_io_enabled() && (0x0400_0000..=0x0400_001E).contains(&addr) {
             println!("[video-io] write16 addr=0x{:08X} value=0x{:04X}", addr, value);
+        }
+
+        if trace_irq_flow_enabled()
+            && (addr == REG_IME
+                || addr == REG_IE
+                || addr == REG_IF
+                || addr == 0x0300_22DC
+                || addr == 0x0300_22F8
+                || addr == REG_DISPCNT
+                || addr == REG_BG0CNT
+                || addr == REG_BG0HOFS
+                || addr == REG_BG0VOFS)
+        {
+            println!(
+                "[irq-flow] write16 addr=0x{:08X} value=0x{:04X} ime=0x{:04X} ie=0x{:04X} if=0x{:04X} chk=0x{:04X} chk_alt=0x{:04X}",
+                addr,
+                value,
+                self.read_io16_raw(REG_IME),
+                self.read_io16_raw(REG_IE),
+                self.read_io16_raw(REG_IF),
+                self.read16(0x0300_22DC),
+                self.read16(0x0300_22F8)
+            );
         }
 
         if trace_bios_bus_enabled()
@@ -840,6 +890,15 @@ fn trace_emerald_state_enabled() -> bool {
     static TRACE: OnceLock<bool> = OnceLock::new();
     *TRACE.get_or_init(|| {
         std::env::var("GBA_TRACE_EMERALD_STATE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn trace_irq_flow_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| {
+        std::env::var("GBA_TRACE_IRQ_FLOW")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })

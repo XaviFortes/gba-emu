@@ -314,10 +314,6 @@ impl Cpu {
     }
 
     fn handle_irq(&mut self, bus: &mut Bus) -> bool {
-        if !bus.has_bios() {
-            return false;
-        }
-
         if (self.cpsr & CPSR_IRQ_DISABLE) != 0 {
             return false;
         }
@@ -326,11 +322,15 @@ impl Cpu {
             return false;
         }
 
+        if !bus.has_bios() && !biosless_irq_stub_enabled() {
+            return false;
+        }
+
         let Some(mask) = bus.claim_pending_interrupt() else {
             return false;
         };
 
-        if trace_bios_irq_enabled() {
+        if trace_bios_irq_enabled() || trace_irq_flow_enabled() {
             println!(
                 "[bios-irq] claim pc=0x{:08X} cpsr=0x{:08X} mask=0x{:04X} ime=0x{:04X} ie=0x{:04X} if=0x{:04X}",
                 self.pc(),
@@ -347,6 +347,12 @@ impl Cpu {
         let bios_flags = bus.read16(0x03FF_FFF8) | mask;
         bus.write16(0x03FF_FFF8, bios_flags);
 
+        if !bus.has_bios() {
+            // In no-BIOS mode there is no BIOS handler to acknowledge IF;
+            // clear the claimed source before dispatching game callback.
+            bus.write_io16(super::bus::REG_IF, mask);
+        }
+
         self.spsr_irq = self.cpsr;
         self.switch_mode(CpuMode::Irq);
 
@@ -357,7 +363,7 @@ impl Cpu {
         self.cpsr &= !CPSR_THUMB;
         self.cpsr |= CPSR_IRQ_DISABLE | CPSR_FIQ_DISABLE;
 
-        if trace_bios_irq_enabled() {
+        if trace_bios_irq_enabled() || trace_irq_flow_enabled() {
             println!(
                 "[bios-irq] enter pc=0x{:08X} lr_irq=0x{:08X} spsr_irq=0x{:08X}",
                 0x0000_0018u32,
@@ -366,14 +372,45 @@ impl Cpu {
             );
         }
 
+        if trace_irq_flow_enabled() {
+            println!(
+                "[irq-flow] enter pending mask=0x{:04X} ime=0x{:04X} ie=0x{:04X} if=0x{:04X} chk=0x{:04X} chk_alt=0x{:04X} dispcnt=0x{:04X} bg0cnt=0x{:04X} bg0hofs=0x{:04X} bg0vofs=0x{:04X}",
+                mask,
+                bus.read_io16(super::bus::REG_IME),
+                bus.read_io16(super::bus::REG_IE),
+                bus.read_io16(super::bus::REG_IF),
+                bus.read16(0x0300_22DC),
+                bus.read16(0x0300_22F8),
+                bus.read_io16(super::bus::REG_DISPCNT),
+                bus.read_io16(0x0400_0008),
+                bus.read_io16(0x0400_0010),
+                bus.read_io16(0x0400_0012)
+            );
+        }
+
         if bus.has_bios() {
             // Standard ARM IRQ vector entry via BIOS.
             self.set_pc(0x0000_0018);
         } else {
-            // BIOS-less mode: emulate BIOS IRQ dispatcher callback.
+            // BIOS-less mode: emulate BIOS IRQ dispatcher stub at 0x00000018,
+            // which forwards to game-installed callback pointer at 0x03FFFFFC.
             let handler = bus.read32(0x03FF_FFFC);
-            if handler == 0 {
-                self.set_pc(0x0000_0018);
+            if !((0x0200_0000..0x0400_0000).contains(&handler)
+                || (0x0800_0000..0x0E00_0000).contains(&handler))
+            {
+                if trace_irq_flow_enabled() {
+                    println!(
+                        "[irq-flow] no valid callback handler=0x{:08X}; returning from IRQ",
+                        handler
+                    );
+                }
+                self.restore_cpsr_from_spsr();
+                let return_pc = self.regs[REG_LR].wrapping_sub(4);
+                if self.is_thumb() {
+                    self.set_pc(return_pc & !1);
+                } else {
+                    self.set_pc(return_pc & !3);
+                }
                 return true;
             }
 
@@ -385,6 +422,12 @@ impl Cpu {
             self.biosless_irq_saved[4] = self.regs[12];
             self.biosless_irq_lr = self.regs[REG_LR];
 
+            // BIOS IRQ stub runs game callback in System mode (not IRQ mode).
+            self.switch_mode(CpuMode::System);
+            self.cpsr = (self.cpsr & 0xF000_0000) | CPSR_IRQ_DISABLE | CPSR_FIQ_DISABLE | 0x1F;
+
+            // BIOS callback calling convention passes IO base in r0.
+            self.regs[0] = 0x0400_0000;
             self.regs[REG_LR] = BIOSLESS_IRQ_RETURN_MAGIC;
             if (handler & 1) != 0 {
                 self.cpsr |= CPSR_THUMB;
@@ -2549,11 +2592,31 @@ impl Cpu {
         self.regs[12] = self.biosless_irq_saved[4];
         self.regs[REG_LR] = self.biosless_irq_lr;
 
-        self.restore_cpsr_from_spsr();
+        // Return from IRQ exception using saved SPSR_irq regardless of current mode.
+        let restored = sanitize_cpsr_mode_bits(self.spsr_irq, self.cpsr & 0x1F);
+        let old_mode = self.mode;
+        let new_mode = mode_from_cpsr(restored);
+        self.cpsr = restored;
+        if new_mode != old_mode {
+            self.switch_mode(new_mode);
+        }
+
         if self.is_thumb() {
             self.set_pc(return_pc & !1);
         } else {
             self.set_pc(return_pc & !3);
+        }
+
+        if trace_irq_flow_enabled() {
+            println!(
+                "[irq-flow] exit return_pc=0x{:08X} cpsr=0x{:08X} r0=0x{:08X} r1=0x{:08X} r2=0x{:08X} r3=0x{:08X}",
+                self.pc(),
+                self.cpsr,
+                self.regs[0],
+                self.regs[1],
+                self.regs[2],
+                self.regs[3]
+            );
         }
     }
 }
@@ -2582,6 +2645,24 @@ fn trace_hle_swi_enabled() -> bool {
     static TRACE: OnceLock<bool> = OnceLock::new();
     *TRACE.get_or_init(|| {
         std::env::var("GBA_TRACE_HLE_SWI")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn trace_irq_flow_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| {
+        std::env::var("GBA_TRACE_IRQ_FLOW")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn biosless_irq_stub_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GBA_ENABLE_BIOSLESS_IRQ_STUB")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
