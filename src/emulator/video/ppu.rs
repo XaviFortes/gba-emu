@@ -34,6 +34,50 @@ const REG_BG3PC: u32 = 0x0400_0034;
 const REG_BG3PD: u32 = 0x0400_0036;
 const REG_BG3X: u32 = 0x0400_0038;
 const REG_BG3Y: u32 = 0x0400_003C;
+const REG_WIN0H: u32 = 0x0400_0040;
+const REG_WIN1H: u32 = 0x0400_0042;
+const REG_WIN0V: u32 = 0x0400_0044;
+const REG_WIN1V: u32 = 0x0400_0046;
+const REG_WININ: u32 = 0x0400_0048;
+const REG_WINOUT: u32 = 0x0400_004A;
+const REG_BLDCNT: u32 = 0x0400_0050;
+const REG_BLDALPHA: u32 = 0x0400_0052;
+const REG_BLDY: u32 = 0x0400_0054;
+
+const LAYER_BG0: u8 = 0;
+const LAYER_BG1: u8 = 1;
+const LAYER_BG2: u8 = 2;
+const LAYER_BG3: u8 = 3;
+const LAYER_OBJ: u8 = 4;
+const LAYER_BD: u8 = 5;
+
+struct PixelStack {
+    priority: [u8; SCREEN_WIDTH],
+    obj_owner: [bool; SCREEN_WIDTH],
+    top_layer: [u8; SCREEN_WIDTH],
+    top_semi: [bool; SCREEN_WIDTH],
+    under_color: [u32; SCREEN_WIDTH],
+    under_prio: [u8; SCREEN_WIDTH],
+    under_layer: [u8; SCREEN_WIDTH],
+    window_layer_mask: [u8; SCREEN_WIDTH],
+    window_effect: [bool; SCREEN_WIDTH],
+}
+
+impl PixelStack {
+    fn new() -> Self {
+        Self {
+            priority: [4; SCREEN_WIDTH],
+            obj_owner: [false; SCREEN_WIDTH],
+            top_layer: [LAYER_BD; SCREEN_WIDTH],
+            top_semi: [false; SCREEN_WIDTH],
+            under_color: [0; SCREEN_WIDTH],
+            under_prio: [5; SCREEN_WIDTH],
+            under_layer: [LAYER_BD; SCREEN_WIDTH],
+            window_layer_mask: [0x1F; SCREEN_WIDTH],
+            window_effect: [true; SCREEN_WIDTH],
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Ppu {
@@ -111,29 +155,32 @@ impl Ppu {
     fn render_scanline(&mut self, bus: &Bus, y: usize) {
         let dispcnt = bus.read_io16(REG_DISPCNT);
         let mode = dispcnt & 0b111;
-        let mut priority = [4u8; SCREEN_WIDTH];
-        let mut obj_owner = [false; SCREEN_WIDTH];
+        let mut stack = PixelStack::new();
+        self.compute_window_state(bus, dispcnt, y, &mut stack);
+
         match mode {
             0 => {
-                self.render_mode0_scanline(bus, y, dispcnt, &mut priority, &mut obj_owner);
+                self.render_mode0_scanline(bus, y, dispcnt, &mut stack);
             }
             1 => {
                 // Mode 1 has text BG0/BG1 plus affine BG2.
-                self.render_mode1_scanline(bus, y, dispcnt, &mut priority, &mut obj_owner);
+                self.render_mode1_scanline(bus, y, dispcnt, &mut stack);
             }
             2 => {
-                self.render_mode2_scanline(bus, y, dispcnt, &mut priority, &mut obj_owner);
+                self.render_mode2_scanline(bus, y, dispcnt, &mut stack);
             }
-            3 => self.render_mode3_scanline(bus, y, dispcnt, &mut priority, &mut obj_owner),
-            4 => self.render_mode4_scanline(bus, y, dispcnt, &mut priority, &mut obj_owner),
-            5 => self.render_mode5_scanline(bus, y, dispcnt, &mut priority, &mut obj_owner),
+            3 => self.render_mode3_scanline(bus, y, dispcnt, &mut stack),
+            4 => self.render_mode4_scanline(bus, y, dispcnt, &mut stack),
+            5 => self.render_mode5_scanline(bus, y, dispcnt, &mut stack),
             _ => self.clear_scanline(y),
         }
 
         // Baseline OBJ pass (normal, non-affine sprites) for all visible modes.
         if (dispcnt & (1 << 12)) != 0 {
-            self.render_obj_scanline(bus, y, dispcnt, &mut priority, &mut obj_owner);
+            self.render_obj_scanline(bus, y, dispcnt, &mut stack);
         }
+
+        self.apply_blend_effects(bus, y, &stack);
     }
 
     fn render_mode4_scanline(
@@ -141,19 +188,9 @@ impl Ppu {
         bus: &Bus,
         y: usize,
         dispcnt: u16,
-        priority: &mut [u8; SCREEN_WIDTH],
-        obj_owner: &mut [bool; SCREEN_WIDTH],
+        stack: &mut PixelStack,
     ) {
-        let row_start = y * SCREEN_WIDTH;
-        let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
-        for (i, px) in self.framebuffer[row_start..row_start + SCREEN_WIDTH]
-            .iter_mut()
-            .enumerate()
-        {
-            *px = backdrop;
-            priority[i] = 4;
-            obj_owner[i] = false;
-        }
+        self.init_scanline_backdrop(bus, y, stack);
 
         if (dispcnt & (1 << 10)) == 0 {
             return;
@@ -164,15 +201,22 @@ impl Ppu {
         let vram = bus.vram();
 
         for x in 0..SCREEN_WIDTH {
-            if bg_prio > priority[x] {
+            if (stack.window_layer_mask[x] & (1 << LAYER_BG2)) == 0 {
                 continue;
             }
-            let off = frame_base + row_start + x;
+            let off = frame_base + (y * SCREEN_WIDTH) + x;
             let index = vram.get(off).copied().unwrap_or(0) as usize;
             let color = bus.read16(PALETTE_RAM_START + (index * 2) as u32);
-            self.framebuffer[row_start + x] = bgr555_to_argb8888(color);
-            priority[x] = bg_prio;
-            obj_owner[x] = false;
+            self.push_pixel(
+                y,
+                x,
+                bgr555_to_argb8888(color),
+                bg_prio,
+                LAYER_BG2,
+                false,
+                false,
+                stack,
+            );
         }
     }
 
@@ -181,19 +225,9 @@ impl Ppu {
         bus: &Bus,
         y: usize,
         dispcnt: u16,
-        priority: &mut [u8; SCREEN_WIDTH],
-        obj_owner: &mut [bool; SCREEN_WIDTH],
+        stack: &mut PixelStack,
     ) {
-        let row_start = y * SCREEN_WIDTH;
-        let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
-        for (i, px) in self.framebuffer[row_start..row_start + SCREEN_WIDTH]
-            .iter_mut()
-            .enumerate()
-        {
-            *px = backdrop;
-            priority[i] = 4;
-            obj_owner[i] = false;
-        }
+        self.init_scanline_backdrop(bus, y, stack);
 
         let mut candidates: Vec<(u16, usize)> = Vec::new();
         for bg in [2usize, 3usize] {
@@ -208,7 +242,7 @@ impl Ppu {
         candidates.sort_by_key(|(priority, _)| *priority);
 
         for (prio, bg) in candidates {
-            self.render_affine_bg_scanline(bus, y, bg, prio as u8, priority, obj_owner);
+            self.render_affine_bg_scanline(bus, y, bg, prio as u8, stack);
         }
     }
 
@@ -217,20 +251,11 @@ impl Ppu {
         bus: &Bus,
         y: usize,
         dispcnt: u16,
-        priority: &mut [u8; SCREEN_WIDTH],
-        obj_owner: &mut [bool; SCREEN_WIDTH],
+        stack: &mut PixelStack,
     ) {
         let vram = bus.vram();
         let row_start = y * SCREEN_WIDTH;
-        let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
-        for (i, px) in self.framebuffer[row_start..row_start + SCREEN_WIDTH]
-            .iter_mut()
-            .enumerate()
-        {
-            *px = backdrop;
-            priority[i] = 4;
-            obj_owner[i] = false;
-        }
+        self.init_scanline_backdrop(bus, y, stack);
 
         if (dispcnt & (1 << 10)) == 0 {
             return;
@@ -239,14 +264,21 @@ impl Ppu {
         let bg_prio = (bus.read_io16(REG_BG2CNT) & 0b11) as u8;
 
         for x in 0..SCREEN_WIDTH {
-            if bg_prio > priority[x] {
+            if (stack.window_layer_mask[x] & (1 << LAYER_BG2)) == 0 {
                 continue;
             }
             let off = (row_start + x) * 2;
             let color = u16::from_le_bytes([vram[off], vram[off + 1]]);
-            self.framebuffer[row_start + x] = bgr555_to_argb8888(color);
-            priority[x] = bg_prio;
-            obj_owner[x] = false;
+            self.push_pixel(
+                y,
+                x,
+                bgr555_to_argb8888(color),
+                bg_prio,
+                LAYER_BG2,
+                false,
+                false,
+                stack,
+            );
         }
     }
 
@@ -255,19 +287,9 @@ impl Ppu {
         bus: &Bus,
         y: usize,
         dispcnt: u16,
-        priority: &mut [u8; SCREEN_WIDTH],
-        obj_owner: &mut [bool; SCREEN_WIDTH],
+        stack: &mut PixelStack,
     ) {
-        let row_start = y * SCREEN_WIDTH;
-        let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
-        for (i, px) in self.framebuffer[row_start..row_start + SCREEN_WIDTH]
-            .iter_mut()
-            .enumerate()
-        {
-            *px = backdrop;
-            priority[i] = 4;
-            obj_owner[i] = false;
-        }
+        self.init_scanline_backdrop(bus, y, stack);
 
         if (dispcnt & (1 << 10)) == 0 {
             return;
@@ -284,7 +306,7 @@ impl Ppu {
         let vram = bus.vram();
 
         for x in 0..160usize {
-            if bg_prio > priority[x] {
+            if (stack.window_layer_mask[x] & (1 << LAYER_BG2)) == 0 {
                 continue;
             }
             let off = frame_base + ((y * 160 + x) * 2);
@@ -292,9 +314,16 @@ impl Ppu {
                 continue;
             }
             let color = u16::from_le_bytes([vram[off], vram[off + 1]]);
-            self.framebuffer[row_start + x] = bgr555_to_argb8888(color);
-            priority[x] = bg_prio;
-            obj_owner[x] = false;
+            self.push_pixel(
+                y,
+                x,
+                bgr555_to_argb8888(color),
+                bg_prio,
+                LAYER_BG2,
+                false,
+                false,
+                stack,
+            );
         }
     }
 
@@ -303,19 +332,9 @@ impl Ppu {
         bus: &Bus,
         y: usize,
         dispcnt: u16,
-        priority: &mut [u8; SCREEN_WIDTH],
-        obj_owner: &mut [bool; SCREEN_WIDTH],
+        stack: &mut PixelStack,
     ) {
-        let row_start = y * SCREEN_WIDTH;
-        let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
-        for (i, px) in self.framebuffer[row_start..row_start + SCREEN_WIDTH]
-            .iter_mut()
-            .enumerate()
-        {
-            *px = backdrop;
-            priority[i] = 4;
-            obj_owner[i] = false;
-        }
+        self.init_scanline_backdrop(bus, y, stack);
 
         let mut candidates: Vec<(u16, usize)> = Vec::new();
         for bg in 0..4 {
@@ -330,7 +349,7 @@ impl Ppu {
         candidates.sort_by_key(|(priority, _)| *priority);
 
         for (prio, bg) in candidates {
-            self.render_text_bg_scanline(bus, y, bg, prio as u8, priority, obj_owner);
+            self.render_text_bg_scanline(bus, y, bg, prio as u8, stack);
         }
     }
 
@@ -339,19 +358,9 @@ impl Ppu {
         bus: &Bus,
         y: usize,
         dispcnt: u16,
-        priority: &mut [u8; SCREEN_WIDTH],
-        obj_owner: &mut [bool; SCREEN_WIDTH],
+        stack: &mut PixelStack,
     ) {
-        let row_start = y * SCREEN_WIDTH;
-        let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
-        for (i, px) in self.framebuffer[row_start..row_start + SCREEN_WIDTH]
-            .iter_mut()
-            .enumerate()
-        {
-            *px = backdrop;
-            priority[i] = 4;
-            obj_owner[i] = false;
-        }
+        self.init_scanline_backdrop(bus, y, stack);
 
         let mut candidates: Vec<(u16, usize)> = Vec::new();
         for bg in 0..2 {
@@ -373,9 +382,9 @@ impl Ppu {
 
         for (prio, bg) in candidates {
             if bg == 2 {
-                self.render_affine_bg_scanline(bus, y, 2, prio as u8, priority, obj_owner);
+                self.render_affine_bg_scanline(bus, y, 2, prio as u8, stack);
             } else {
-                self.render_text_bg_scanline(bus, y, bg, prio as u8, priority, obj_owner);
+                self.render_text_bg_scanline(bus, y, bg, prio as u8, stack);
             }
         }
     }
@@ -386,8 +395,7 @@ impl Ppu {
         y: usize,
         bg: usize,
         bg_prio: u8,
-        priority: &mut [u8; SCREEN_WIDTH],
-        obj_owner: &mut [bool; SCREEN_WIDTH],
+        stack: &mut PixelStack,
     ) {
         let (pa_addr, pb_addr, pc_addr, pd_addr, x_addr, y_addr) = match bg {
             2 => (REG_BG2PA, REG_BG2PB, REG_BG2PC, REG_BG2PD, REG_BG2X, REG_BG2Y),
@@ -416,7 +424,6 @@ impl Ppu {
         let map_base = map_base_block * 0x800;
         let char_base = char_base_block * 0x4000;
         let tiles_per_row = bg_size / 8;
-        let row_start = y * SCREEN_WIDTH;
         let y_i32 = y as i32;
         let vram = bus.vram();
 
@@ -424,7 +431,7 @@ impl Ppu {
         let mut cur_y = ref_y + pd * y_i32;
 
         for x in 0..SCREEN_WIDTH {
-            if bg_prio > priority[x] {
+            if (stack.window_layer_mask[x] & (1 << (bg as u8))) == 0 {
                 cur_x = cur_x.wrapping_add(pa);
                 cur_y = cur_y.wrapping_add(pc);
                 continue;
@@ -470,9 +477,16 @@ impl Ppu {
             }
 
             let color = bus.read16(PALETTE_RAM_START + (color_index * 2) as u32);
-            self.framebuffer[row_start + x] = bgr555_to_argb8888(color);
-            priority[x] = bg_prio;
-            obj_owner[x] = false;
+            self.push_pixel(
+                y,
+                x,
+                bgr555_to_argb8888(color),
+                bg_prio,
+                bg as u8,
+                false,
+                false,
+                stack,
+            );
         }
     }
 
@@ -482,8 +496,7 @@ impl Ppu {
         y: usize,
         bg: usize,
         bg_prio: u8,
-        priority: &mut [u8; SCREEN_WIDTH],
-        obj_owner: &mut [bool; SCREEN_WIDTH],
+        stack: &mut PixelStack,
     ) {
         let bgcnt = bus.read_io16(bg_cnt_addr(bg));
         let hofs = (bus.read_io16(bg_hofs_addr(bg)) & 0x1FF) as usize;
@@ -505,11 +518,10 @@ impl Ppu {
         let tile_y = (map_y / 8) % height_tiles;
         let in_tile_y = map_y % 8;
 
-        let row_start = y * SCREEN_WIDTH;
         let vram = bus.vram();
 
         for x in 0..SCREEN_WIDTH {
-            if bg_prio > priority[x] {
+            if (stack.window_layer_mask[x] & (1 << (bg as u8))) == 0 {
                 continue;
             }
             let map_x = (map_x_base + x) % (width_tiles * 8);
@@ -524,7 +536,6 @@ impl Ppu {
             let entry_off = screen_base + map_index * 2;
 
             if entry_off + 1 >= vram.len() {
-                self.framebuffer[row_start + x] = 0xFF00_0000;
                 continue;
             }
 
@@ -563,9 +574,153 @@ impl Ppu {
             }
 
             let color = bus.read16(PALETTE_RAM_START + (palette_index * 2) as u32);
-            self.framebuffer[row_start + x] = bgr555_to_argb8888(color);
-            priority[x] = bg_prio;
-            obj_owner[x] = false;
+            self.push_pixel(
+                y,
+                x,
+                bgr555_to_argb8888(color),
+                bg_prio,
+                bg as u8,
+                false,
+                false,
+                stack,
+            );
+        }
+    }
+
+    fn init_scanline_backdrop(&mut self, bus: &Bus, y: usize, stack: &mut PixelStack) {
+        let row_start = y * SCREEN_WIDTH;
+        let backdrop = bgr555_to_argb8888(bus.read16(PALETTE_RAM_START));
+        for (i, px) in self.framebuffer[row_start..row_start + SCREEN_WIDTH]
+            .iter_mut()
+            .enumerate()
+        {
+            *px = backdrop;
+            stack.priority[i] = 4;
+            stack.obj_owner[i] = false;
+            stack.top_layer[i] = LAYER_BD;
+            stack.top_semi[i] = false;
+            stack.under_color[i] = backdrop;
+            stack.under_prio[i] = 5;
+            stack.under_layer[i] = LAYER_BD;
+        }
+    }
+
+    fn compute_window_state(&self, bus: &Bus, dispcnt: u16, y: usize, stack: &mut PixelStack) {
+        let win0_en = (dispcnt & (1 << 13)) != 0;
+        let win1_en = (dispcnt & (1 << 14)) != 0;
+        let objwin_en = (dispcnt & (1 << 15)) != 0;
+
+        if !win0_en && !win1_en && !objwin_en {
+            stack.window_layer_mask.fill(0x1F);
+            stack.window_effect.fill(true);
+            return;
+        }
+
+        let win0h = bus.read_io16(REG_WIN0H);
+        let win1h = bus.read_io16(REG_WIN1H);
+        let win0v = bus.read_io16(REG_WIN0V);
+        let win1v = bus.read_io16(REG_WIN1V);
+        let winin = bus.read_io16(REG_WININ);
+        let winout = bus.read_io16(REG_WINOUT);
+
+        let y_u8 = y as u8;
+        let in_win0_v = win0_en && in_window_range(y_u8, (win0v >> 8) as u8, (win0v & 0xFF) as u8);
+        let in_win1_v = win1_en && in_window_range(y_u8, (win1v >> 8) as u8, (win1v & 0xFF) as u8);
+
+        for x in 0..SCREEN_WIDTH {
+            let x_u8 = x as u8;
+            let in_win0 = in_win0_v && in_window_range(x_u8, (win0h >> 8) as u8, (win0h & 0xFF) as u8);
+            let in_win1 = in_win1_v && in_window_range(x_u8, (win1h >> 8) as u8, (win1h & 0xFF) as u8);
+
+            let control = if in_win0 {
+                (winin & 0x00FF) as u8
+            } else if in_win1 {
+                ((winin >> 8) & 0x00FF) as u8
+            } else {
+                (winout & 0x00FF) as u8
+            };
+
+            stack.window_layer_mask[x] = control & 0x1F;
+            stack.window_effect[x] = (control & 0x20) != 0;
+        }
+    }
+
+    fn push_pixel(
+        &mut self,
+        y: usize,
+        x: usize,
+        color: u32,
+        prio: u8,
+        layer: u8,
+        is_obj: bool,
+        is_semitransparent: bool,
+        stack: &mut PixelStack,
+    ) {
+        let row_start = y * SCREEN_WIDTH;
+
+        if should_overwrite(prio, is_obj, stack.priority[x], stack.obj_owner[x]) {
+            stack.under_color[x] = self.framebuffer[row_start + x];
+            stack.under_prio[x] = stack.priority[x];
+            stack.under_layer[x] = stack.top_layer[x];
+
+            self.framebuffer[row_start + x] = color;
+            stack.priority[x] = prio;
+            stack.obj_owner[x] = is_obj;
+            stack.top_layer[x] = layer;
+            stack.top_semi[x] = is_obj && is_semitransparent;
+        } else if should_overwrite(prio, is_obj, stack.under_prio[x], stack.under_layer[x] == LAYER_OBJ) {
+            stack.under_color[x] = color;
+            stack.under_prio[x] = prio;
+            stack.under_layer[x] = layer;
+        }
+    }
+
+    fn apply_blend_effects(&mut self, bus: &Bus, y: usize, stack: &PixelStack) {
+        let bldcnt = bus.read_io16(REG_BLDCNT);
+        let effect = ((bldcnt >> 6) & 0x3) as u8;
+        let target1 = bldcnt & 0x003F;
+        let target2 = (bldcnt >> 8) & 0x003F;
+
+        let bldalpha = bus.read_io16(REG_BLDALPHA);
+        let eva = ((bldalpha & 0x1F) as u32).min(16);
+        let evb = (((bldalpha >> 8) & 0x1F) as u32).min(16);
+        let evy = ((bus.read_io16(REG_BLDY) & 0x1F) as u32).min(16);
+
+        let row_start = y * SCREEN_WIDTH;
+        for x in 0..SCREEN_WIDTH {
+            if !stack.window_effect[x] {
+                continue;
+            }
+
+            let top = self.framebuffer[row_start + x];
+            let under = stack.under_color[x];
+            let top_bit = layer_to_target_bit(stack.top_layer[x]);
+            let under_bit = layer_to_target_bit(stack.under_layer[x]);
+
+            let out = if stack.top_semi[x] {
+                if (target2 & under_bit) != 0 {
+                    alpha_blend(top, under, eva, evb)
+                } else {
+                    top
+                }
+            } else if (target1 & top_bit) == 0 {
+                top
+            } else {
+                match effect {
+                    1 => {
+                        if (target2 & under_bit) != 0 {
+                            alpha_blend(top, under, eva, evb)
+                        } else {
+                            top
+                        }
+                    }
+                    2 => brighten(top, evy),
+                    3 => darken(top, evy),
+                    _ => top,
+                }
+            };
+
+            self.framebuffer[row_start + x] = out;
         }
     }
 
@@ -582,12 +737,10 @@ impl Ppu {
         bus: &Bus,
         y: usize,
         dispcnt: u16,
-        priority: &mut [u8; SCREEN_WIDTH],
-        obj_owner: &mut [bool; SCREEN_WIDTH],
+        stack: &mut PixelStack,
     ) {
         let one_dim_obj = (dispcnt & (1 << 6)) != 0;
         let vram = bus.vram();
-        let row_start = y * SCREEN_WIDTH;
         let y_u16 = y as u16;
 
         for obj in 0..128usize {
@@ -596,7 +749,7 @@ impl Ppu {
             let attr1 = bus.read16(base + 2);
             let attr2 = bus.read16(base + 4);
 
-            let obj_mode = (attr0 >> 8) & 0x3;
+            let obj_mode = (attr0 >> 10) & 0x3;
             let is_affine = (attr0 & (1 << 8)) != 0;
             let affine_double = is_affine && (attr0 & (1 << 9)) != 0;
             let mosaic = (attr0 & (1 << 12)) != 0;
@@ -653,6 +806,11 @@ impl Ppu {
                 if !(0..SCREEN_WIDTH as i32).contains(&screen_x) {
                     continue;
                 }
+                let px = screen_x as usize;
+
+                if (stack.window_layer_mask[px] & (1 << LAYER_OBJ)) == 0 {
+                    continue;
+                }
 
                 let (in_obj_x, in_obj_y) = if is_affine {
                     let cx_draw = (draw_width / 2) as i32;
@@ -707,23 +865,22 @@ impl Ppu {
                     continue;
                 }
 
-                let px = screen_x as usize;
-                let can_draw = obj_prio < priority[px]
-                    || (obj_prio == priority[px] && !obj_owner[px]);
-                if !can_draw {
-                    continue;
-                }
-
                 let palette_index = if is_8bpp {
                     0x100 + color_index
                 } else {
                     0x100 + palette_bank * 16 + color_index
                 };
                 let color = bus.read16(PALETTE_RAM_START + (palette_index * 2) as u32);
-
-                self.framebuffer[row_start + px] = bgr555_to_argb8888(color);
-                priority[px] = obj_prio;
-                obj_owner[px] = true;
+                self.push_pixel(
+                    y,
+                    px,
+                    bgr555_to_argb8888(color),
+                    obj_prio,
+                    LAYER_OBJ,
+                    true,
+                    obj_mode == 0b01,
+                    stack,
+                );
             }
         }
     }
@@ -817,4 +974,72 @@ fn read_obj_affine_params(bus: &Bus, param_index: usize) -> (i16, i16, i16, i16)
     let pc = bus.read16(base + 0x16) as i16;
     let pd = bus.read16(base + 0x1E) as i16;
     (pa, pb, pc, pd)
+}
+
+fn should_overwrite(new_prio: u8, new_is_obj: bool, old_prio: u8, old_is_obj: bool) -> bool {
+    if new_is_obj {
+        new_prio < old_prio || (new_prio == old_prio && !old_is_obj)
+    } else {
+        new_prio <= old_prio
+    }
+}
+
+fn in_window_range(value: u8, start: u8, end: u8) -> bool {
+    if start < end {
+        value >= start && value < end
+    } else if start > end {
+        value >= start || value < end
+    } else {
+        false
+    }
+}
+
+fn layer_to_target_bit(layer: u8) -> u16 {
+    match layer {
+        LAYER_BG0 => 1 << 0,
+        LAYER_BG1 => 1 << 1,
+        LAYER_BG2 => 1 << 2,
+        LAYER_BG3 => 1 << 3,
+        LAYER_OBJ => 1 << 4,
+        _ => 1 << 5,
+    }
+}
+
+fn alpha_blend(top: u32, under: u32, eva: u32, evb: u32) -> u32 {
+    let tr = (top >> 16) & 0xFF;
+    let tg = (top >> 8) & 0xFF;
+    let tb = top & 0xFF;
+    let ur = (under >> 16) & 0xFF;
+    let ug = (under >> 8) & 0xFF;
+    let ub = under & 0xFF;
+
+    let r = ((tr * eva + ur * evb) / 16).min(255);
+    let g = ((tg * eva + ug * evb) / 16).min(255);
+    let b = ((tb * eva + ub * evb) / 16).min(255);
+
+    0xFF00_0000 | (r << 16) | (g << 8) | b
+}
+
+fn brighten(color: u32, evy: u32) -> u32 {
+    let r = ((color >> 16) & 0xFF).min(255);
+    let g = ((color >> 8) & 0xFF).min(255);
+    let b = (color & 0xFF).min(255);
+
+    let r = r + (((255 - r) * evy) / 16);
+    let g = g + (((255 - g) * evy) / 16);
+    let b = b + (((255 - b) * evy) / 16);
+
+    0xFF00_0000 | (r << 16) | (g << 8) | b
+}
+
+fn darken(color: u32, evy: u32) -> u32 {
+    let r = (color >> 16) & 0xFF;
+    let g = (color >> 8) & 0xFF;
+    let b = color & 0xFF;
+
+    let r = r - ((r * evy) / 16);
+    let g = g - ((g * evy) / 16);
+    let b = b - ((b * evy) / 16);
+
+    0xFF00_0000 | (r << 16) | (g << 8) | b
 }
