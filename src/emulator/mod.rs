@@ -132,16 +132,7 @@ impl Gba {
             self.input.tick(&mut self.bus);
 
             if !self.bus.has_bios() {
-                // Emerald no-BIOS compatibility: keep callback-polled IRQ-ready bytes set
-                // so startup gate loops do not deadlock waiting on BIOS-maintained state.
-                self.bus.write8(0x0300_34A9, 1);
-                self.bus.write8(0x0300_6A0C, 1);
-
-                // Startup wait loops periodically clear bit0 and expect IRQ callback
-                // heartbeat to set it again out-of-band.
-                self.bus.write16(0x0300_22DC, self.bus.read16(0x0300_22DC) | 0x0001);
-                self.bus.write16(0x0300_22F8, self.bus.read16(0x0300_22F8) | 0x0001);
-
+                // Mirror pending IF sources into software IRQ-check words.
                 let iflags = self.bus.read_io16(core::bus::REG_IF);
                 if iflags != 0 {
                     let irq_check = self.bus.read16(0x0300_22DC) | iflags | 0x0001;
@@ -254,7 +245,21 @@ impl Gba {
     }
 
     pub fn force_boot_to_rom_without_bios(&mut self) {
+        let keep_bios_mapped = keep_bios_mapped_handoff_enabled();
+        if keep_bios_mapped {
+            println!("[boot] keeping BIOS mapped and jumping to ROM entry");
+            self.cpu.jump_to_rom_entry();
+            return;
+        }
+
         println!("[boot] disabling BIOS mapping and jumping to ROM entry");
+
+        // Initialize BIOS-less IRQ callback contract region in mirrored IWRAM.
+        self.bus.write16(0x03FF_FFF8, 0);
+        self.bus.write32(0x03FF_FFFC, 0);
+        self.bus.write16(0x0300_22DC, 0);
+        self.bus.write16(0x0300_22F8, 0);
+
         self.bus.disable_bios();
         self.cpu.jump_to_rom_entry();
     }
@@ -264,6 +269,15 @@ fn internal_bios_handoff_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         !std::env::var("GBA_DISABLE_INTERNAL_BIOS_HANDOFF")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn keep_bios_mapped_handoff_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GBA_KEEP_BIOS_MAPPED_ON_HANDOFF")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })

@@ -536,7 +536,20 @@ impl Bus {
         if addr == REG_IF {
             // IF is write-1-to-clear.
             let current = self.read_io16_raw(REG_IF);
+            let clear_mask = current & value;
             self.write_io16_raw(REG_IF, current & !value);
+
+            if !self.bios_loaded && clear_mask != 0 {
+                // Keep software IRQ mirrors in sync with acknowledged IF bits.
+                let bios_flags = self.read16(0x03FF_FFF8) & !clear_mask;
+                self.write16(0x03FF_FFF8, bios_flags);
+
+                let irq_check = self.read16(0x0300_22DC) & !clear_mask;
+                self.write16(0x0300_22DC, irq_check);
+
+                let irq_check_alt = self.read16(0x0300_22F8) & !clear_mask;
+                self.write16(0x0300_22F8, irq_check_alt);
+            }
             return;
         }
 

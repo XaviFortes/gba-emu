@@ -65,6 +65,7 @@ pub struct Cpu {
     banked_sp_sys: u32,
     banked_lr_sys: u32,
     biosless_irq_active: bool,
+    biosless_irq_frame_sp: u32,
     biosless_irq_saved: [u32; 5],
     biosless_irq_lr: u32,
     pub halted: bool,
@@ -105,6 +106,7 @@ impl Cpu {
             banked_sp_sys: 0x0300_7F00,
             banked_lr_sys: 0,
             biosless_irq_active: false,
+            biosless_irq_frame_sp: 0,
             biosless_irq_saved: [0; 5],
             biosless_irq_lr: 0,
             halted: false,
@@ -148,6 +150,7 @@ impl Cpu {
         self.banked_sp_sys = self.regs[REG_SP];
         self.banked_lr_sys = self.regs[REG_LR];
         self.biosless_irq_active = false;
+        self.biosless_irq_frame_sp = 0;
         self.biosless_irq_saved = [0; 5];
         self.biosless_irq_lr = 0;
         self.halted = false;
@@ -197,6 +200,27 @@ impl Cpu {
     pub fn jump_to_rom_entry(&mut self) {
         // BIOS-preserving handoff: enter ROM at ARM/System mode without wiping
         // memory/peripheral state established by BIOS initialization.
+        // Establish the conventional post-BIOS stack layout used by commercial games.
+        self.banked_sp_sys = 0x0300_7F00;
+        self.banked_sp_fiq = 0x0300_7F00;
+        self.banked_sp_abt = 0x0300_7F00;
+        self.banked_sp_und = 0x0300_7F00;
+        self.banked_sp_irq = 0x0300_7FA0;
+        self.banked_sp_svc = 0x0300_7FE0;
+
+        self.banked_lr_sys = 0;
+        self.banked_lr_fiq = 0;
+        self.banked_lr_abt = 0;
+        self.banked_lr_und = 0;
+        self.banked_lr_irq = 0;
+        self.banked_lr_svc = 0;
+
+        self.spsr_irq = 0;
+        self.spsr_svc = 0;
+        self.spsr_fiq = 0;
+        self.spsr_abt = 0;
+        self.spsr_und = 0;
+
         self.switch_mode(CpuMode::System);
         self.cpsr = (self.cpsr & 0xF000_0000) | 0x0000_001F;
         self.regs[0] = GAMEPAK_ROM_START;
@@ -412,12 +436,10 @@ impl Cpu {
             return false;
         }
 
-        let Some(mask) = bus.claim_pending_interrupt() else {
+        let pending = bus.read_io16(super::bus::REG_IE) & bus.read_io16(super::bus::REG_IF);
+        if pending == 0 {
             return false;
-        };
-
-        // Without BIOS vector code, acknowledge the claimed IF source here.
-        bus.write_io16(super::bus::REG_IF, mask);
+        }
 
         self.spsr_irq = self.cpsr;
         self.switch_mode(CpuMode::Irq);
@@ -426,21 +448,23 @@ impl Cpu {
         self.cpsr &= !CPSR_THUMB;
         self.cpsr |= CPSR_IRQ_DISABLE | CPSR_FIQ_DISABLE;
 
-        // Emulate BIOS IRQ trampoline stack frame:
-        // stmfd r13!, {r0-r3,r12,r14}
-        let mut sp = self.regs[REG_SP].wrapping_sub(24);
-        bus.write32(sp, self.regs[0]);
+        // Emulate BIOS IRQ trampoline save frame (vector 0x18):
+        // stmfd sp!, {r12,lr}; mrs r12,spsr; mrs lr,cpsr; stmfd sp!, {r12,lr}
+        let saved_r12 = self.regs[12];
+        let saved_lr = self.regs[REG_LR];
+        let saved_spsr = self.spsr_irq;
+        let saved_cpsr = self.cpsr;
+
+        let mut sp = self.regs[REG_SP].wrapping_sub(16);
+        bus.write32(sp, saved_r12);
         sp = sp.wrapping_add(4);
-        bus.write32(sp, self.regs[1]);
+        bus.write32(sp, saved_lr);
         sp = sp.wrapping_add(4);
-        bus.write32(sp, self.regs[2]);
+        bus.write32(sp, saved_spsr);
         sp = sp.wrapping_add(4);
-        bus.write32(sp, self.regs[3]);
-        sp = sp.wrapping_add(4);
-        bus.write32(sp, self.regs[12]);
-        sp = sp.wrapping_add(4);
-        bus.write32(sp, self.regs[REG_LR]);
-        self.regs[REG_SP] = self.regs[REG_SP].wrapping_sub(24);
+        bus.write32(sp, saved_cpsr);
+        self.biosless_irq_frame_sp = self.regs[REG_SP].wrapping_sub(16);
+        self.regs[REG_SP] = self.regs[REG_SP].wrapping_sub(16);
 
         self.biosless_irq_active = true;
 
@@ -2556,21 +2580,22 @@ impl Cpu {
         self.biosless_irq_active = false;
 
         // Emulate BIOS IRQ trampoline epilogue:
-        // ldmfd r13!, {r0-r3,r12,r14}
-        let mut sp = self.regs[REG_SP];
-        self.regs[0] = bus.read32(sp);
+        // ldmfd sp!, {r12,lr}; msr spsr, r12; ldmfd sp!, {r12,lr}; subs pc,lr,#4
+        // BIOS reloads IRQ SP from a fixed location before epilogue.
+        let mut sp = self.biosless_irq_frame_sp;
+        let saved_r12 = bus.read32(sp);
         sp = sp.wrapping_add(4);
-        self.regs[1] = bus.read32(sp);
+        let saved_lr = bus.read32(sp);
         sp = sp.wrapping_add(4);
-        self.regs[2] = bus.read32(sp);
+        let saved_spsr = bus.read32(sp);
         sp = sp.wrapping_add(4);
-        self.regs[3] = bus.read32(sp);
-        sp = sp.wrapping_add(4);
-        self.regs[12] = bus.read32(sp);
-        sp = sp.wrapping_add(4);
-        self.regs[REG_LR] = bus.read32(sp);
+        let _saved_cpsr = bus.read32(sp);
         sp = sp.wrapping_add(4);
         self.regs[REG_SP] = sp;
+
+        self.regs[12] = saved_r12;
+        self.regs[REG_LR] = saved_lr;
+        self.spsr_irq = saved_spsr;
 
         // Return from IRQ exception using saved SPSR_irq regardless of current mode.
         let restored = sanitize_cpsr_mode_bits(self.spsr_irq, self.cpsr & 0x1F);
