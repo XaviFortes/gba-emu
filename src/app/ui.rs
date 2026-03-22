@@ -16,6 +16,7 @@ pub struct LauncherSelection {
     pub bios_path: Option<String>,
     pub scale: Scale,
     pub audio_output: LauncherAudioOutput,
+    pub master_volume: f32,
 }
 
 #[derive(Debug)]
@@ -27,6 +28,8 @@ struct LauncherState {
     use_bios: bool,
     bios_candidate: Option<PathBuf>,
     audio_output: LauncherAudioOutput,
+    master_volume_percent: u8,
+    audio_backend_info: String,
 }
 
 const UI_WIDTH: usize = 1280;
@@ -36,6 +39,7 @@ pub fn run_launcher(
     roms_dir: Option<&str>,
     bios_arg: Option<&str>,
     default_scale: u32,
+    audio_backend_info: &str,
 ) -> Result<Option<LauncherSelection>, String> {
     let mut window = Window::new(
         "GBA Emulator - Launcher",
@@ -63,6 +67,8 @@ pub fn run_launcher(
         use_bios: true,
         bios_candidate: resolve_bios_candidate(bios_arg),
         audio_output: LauncherAudioOutput::Default,
+        master_volume_percent: 80,
+        audio_backend_info: audio_backend_info.to_string(),
     };
 
     if state.bios_candidate.is_none() {
@@ -105,6 +111,7 @@ fn finalize_selection(state: &LauncherState) -> Option<LauncherSelection> {
         },
         scale: scale_from_u32(state.scale),
         audio_output: state.audio_output,
+        master_volume: (state.master_volume_percent as f32 / 100.0).clamp(0.0, 1.0),
     })
 }
 
@@ -126,7 +133,7 @@ fn handle_input(window: &mut Window, state: &mut LauncherState, rom_root: &Path)
     }
 
     if window.is_key_pressed(Key::Down, KeyRepeat::Yes) {
-        state.selected_setting = (state.selected_setting + 1).min(2);
+        state.selected_setting = (state.selected_setting + 1).min(3);
     }
 
     if window.is_key_pressed(Key::A, KeyRepeat::No) {
@@ -160,9 +167,15 @@ fn adjust_setting(state: &mut LauncherState, increase: bool) {
             }
         }
         _ => {
-            state.audio_output = match state.audio_output {
-                LauncherAudioOutput::Default => LauncherAudioOutput::Muted,
-                LauncherAudioOutput::Muted => LauncherAudioOutput::Default,
+            if state.selected_setting == 2 {
+                state.audio_output = match state.audio_output {
+                    LauncherAudioOutput::Default => LauncherAudioOutput::Muted,
+                    LauncherAudioOutput::Muted => LauncherAudioOutput::Default,
+                }
+            } else if increase {
+                state.master_volume_percent = (state.master_volume_percent + 5).min(100);
+            } else {
+                state.master_volume_percent = state.master_volume_percent.saturating_sub(5);
             }
         }
     }
@@ -326,6 +339,7 @@ fn draw_settings_panel(fb: &mut [u32], state: &LauncherState) {
                 LauncherAudioOutput::Muted => "Muted",
             }
         ),
+        format!("Master Volume: {}%", state.master_volume_percent),
     ];
 
     for (i, text) in labels.iter().enumerate() {
@@ -346,12 +360,23 @@ fn draw_settings_panel(fb: &mut [u32], state: &LauncherState) {
         draw_text(fb, panel_x + 30, y + 16, 1, row_fg, text);
     }
 
-    draw_text(fb, panel_x + 20, panel_y + 320, 1, 0xFF9F_AEC2, "Controls");
-    draw_text(fb, panel_x + 20, panel_y + 346, 1, 0xFFC6_D2E4, "Left/Right: Pick game");
-    draw_text(fb, panel_x + 20, panel_y + 364, 1, 0xFFC6_D2E4, "Up/Down: Select setting");
-    draw_text(fb, panel_x + 20, panel_y + 382, 1, 0xFFC6_D2E4, "A / D: Change value");
-    draw_text(fb, panel_x + 20, panel_y + 400, 1, 0xFFC6_D2E4, "R: Rescan ROMs");
-    draw_text(fb, panel_x + 20, panel_y + 418, 1, 0xFFC6_D2E4, "Enter: Launch game");
+    draw_text(fb, panel_x + 20, panel_y + 318, 1, 0xFF9F_AEC2, "Audio Backend");
+    draw_wrapped_text(
+        fb,
+        panel_x + 20,
+        panel_y + 338,
+        panel_w - 40,
+        1,
+        0xFFC6_D2E4,
+        &state.audio_backend_info,
+    );
+
+    draw_text(fb, panel_x + 20, panel_y + 384, 1, 0xFF9F_AEC2, "Controls");
+    draw_text(fb, panel_x + 20, panel_y + 402, 1, 0xFFC6_D2E4, "Left/Right: Pick game");
+    draw_text(fb, panel_x + 20, panel_y + 420, 1, 0xFFC6_D2E4, "Up/Down: Select setting");
+    draw_text(fb, panel_x + 20, panel_y + 438, 1, 0xFFC6_D2E4, "A / D: Change value");
+    draw_text(fb, panel_x + 20, panel_y + 456, 1, 0xFFC6_D2E4, "R: Rescan ROMs");
+    draw_text(fb, panel_x + 20, panel_y + 474, 1, 0xFFC6_D2E4, "Enter: Launch game");
 }
 
 fn scale_from_u32(value: u32) -> Scale {

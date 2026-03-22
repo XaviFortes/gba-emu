@@ -148,6 +148,8 @@ Launcher settings currently include:
 - Window scale preset
 - BIOS on/off toggle (auto-detected from `--bios` or `gba_bios.bin`)
 - Audio output mode (`Default` / `Muted` UI toggle)
+- Master volume control
+- Audio backend/device info (current default output backend status)
 
 ## Project Structure
 

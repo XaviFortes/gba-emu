@@ -248,6 +248,14 @@ impl Gba {
         self.apu.set_muted(muted);
     }
 
+    pub fn set_audio_master_volume(&mut self, volume: f32) {
+        self.apu.set_master_volume(volume);
+    }
+
+    pub fn audio_backend_info(&self) -> String {
+        self.apu.backend_info()
+    }
+
     pub fn force_boot_to_rom_without_bios(&mut self) {
         let keep_bios_mapped = keep_bios_mapped_handoff_enabled();
         if keep_bios_mapped {

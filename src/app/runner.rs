@@ -175,12 +175,13 @@ fn boot_system(gba: &mut Gba, rom_path: &str, bios_path: Option<&str>) -> Result
     Ok(())
 }
 
-fn selection_from_args(args: &CliArgs) -> Result<LauncherSelection, ExitCode> {
+fn selection_from_args(args: &CliArgs, audio_backend_info: &str) -> Result<LauncherSelection, ExitCode> {
     if args.launcher || args.rom_path.is_none() {
         let selection = match run_launcher(
             args.roms_dir.as_deref(),
             args.bios_path.as_deref(),
             args.window_scale.unwrap_or(4),
+            audio_backend_info,
         ) {
             Ok(Some(selection)) => selection,
             Ok(None) => return Err(ExitCode::SUCCESS),
@@ -202,6 +203,7 @@ fn selection_from_args(args: &CliArgs) -> Result<LauncherSelection, ExitCode> {
         bios_path: args.bios_path.clone(),
         scale: map_scale(args.window_scale.unwrap_or(4)),
         audio_output: LauncherAudioOutput::Default,
+        master_volume: 0.8,
     })
 }
 
@@ -219,8 +221,9 @@ fn map_scale(scale: u32) -> Scale {
 
 pub fn run(args: CliArgs) -> ExitCode {
     let mut gba = Gba::new();
+    let backend_info = gba.audio_backend_info();
 
-    let selection = match selection_from_args(&args) {
+    let selection = match selection_from_args(&args, &backend_info) {
         Ok(selection) => selection,
         Err(code) => return code,
     };
@@ -239,6 +242,7 @@ pub fn run(args: CliArgs) -> ExitCode {
 
     let muted = matches!(selection.audio_output, LauncherAudioOutput::Muted);
     gba.set_audio_muted(muted);
+    gba.set_audio_master_volume(selection.master_volume);
     if muted {
         println!("[audio] launcher setting: muted");
     }

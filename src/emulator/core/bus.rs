@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -48,6 +49,9 @@ const REG_SIOMULTI1: u32 = IO_START + 0x122;
 const REG_SIOMULTI2: u32 = IO_START + 0x124;
 const REG_SIOMULTI3: u32 = IO_START + 0x126;
 const REG_SIOCNT: u32 = IO_START + 0x128;
+const REG_SOUNDCNT_H: u32 = IO_START + 0x082;
+const REG_FIFO_A_L: u32 = IO_START + 0x0A0;
+const REG_FIFO_B_L: u32 = IO_START + 0x0A4;
 pub const REG_IE: u32 = IO_START + 0x200;
 pub const REG_IF: u32 = IO_START + 0x202;
 pub const REG_IME: u32 = IO_START + 0x208;
@@ -88,6 +92,14 @@ struct TimerState {
     reload: u16,
 }
 
+#[derive(Debug, Default, Clone)]
+struct DirectSoundState {
+    fifo_a: VecDeque<i8>,
+    fifo_b: VecDeque<i8>,
+    sample_a: i8,
+    sample_b: i8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RtcTransferState {
     Idle,
@@ -112,6 +124,7 @@ pub struct Bus {
     halt_requested: bool,
     flash_cmd_stage: u8,
     flash_id_mode: bool,
+    direct_sound: DirectSoundState,
     gamepak_gpio_data: u8,
     gamepak_gpio_dir: u8,
     gamepak_gpio_cnt: u8,
@@ -153,6 +166,7 @@ impl Bus {
             halt_requested: false,
             flash_cmd_stage: 0,
             flash_id_mode: false,
+            direct_sound: DirectSoundState::default(),
             gamepak_gpio_data: 0,
             gamepak_gpio_dir: 0,
             gamepak_gpio_cnt: 0,
@@ -206,6 +220,7 @@ impl Bus {
         self.halt_requested = false;
         self.flash_cmd_stage = 0;
         self.flash_id_mode = false;
+        self.direct_sound = DirectSoundState::default();
         self.gamepak_gpio_data = 0;
         self.gamepak_gpio_dir = 0;
         self.gamepak_gpio_cnt = 0;
@@ -454,6 +469,13 @@ impl Bus {
         }
 
         if (IO_START..IO_START + IO_SIZE as u32).contains(&addr) {
+            if addr == REG_FIFO_A_L || addr == REG_FIFO_B_L {
+                let index = (addr - IO_START) as usize;
+                self.io[index] = value;
+                self.push_direct_sound_byte(addr, value);
+                return;
+            }
+
             if addr == REG_HALTCNT {
                 // HALTCNT bit7=0 enters HALT (STOP is bit7=1 and remains unimplemented).
                 if (value & 0x80) == 0 {
@@ -781,6 +803,13 @@ impl Bus {
         }
 
         if (IO_START..IO_START + IO_SIZE as u32).contains(&addr) {
+            if addr == REG_FIFO_A_L || addr == REG_FIFO_B_L {
+                self.write_io16_raw(addr, value);
+                self.push_direct_sound_byte(addr, (value & 0x00FF) as u8);
+                self.push_direct_sound_byte(addr, (value >> 8) as u8);
+                return;
+            }
+
             let old_value = self.read_io16_raw(addr);
             self.write_io16_raw(addr, value);
             self.handle_side_effects_16(addr, old_value, value);
@@ -813,6 +842,15 @@ impl Bus {
         }
 
         if (IO_START..IO_START + IO_SIZE as u32).contains(&addr) {
+            if addr == REG_FIFO_A_L || addr == REG_FIFO_B_L {
+                self.write_io32_raw(addr, value);
+                self.push_direct_sound_byte(addr, (value & 0x0000_00FF) as u8);
+                self.push_direct_sound_byte(addr, ((value >> 8) & 0xFF) as u8);
+                self.push_direct_sound_byte(addr, ((value >> 16) & 0xFF) as u8);
+                self.push_direct_sound_byte(addr, ((value >> 24) & 0xFF) as u8);
+                return;
+            }
+
             self.write16(addr, (value & 0xFFFF) as u16);
             self.write16(addr.wrapping_add(2), (value >> 16) as u16);
             return;
@@ -958,6 +996,7 @@ impl Bus {
                 counter = counter.wrapping_add(1);
                 if counter == 0 {
                     counter = self.timers[i].reload;
+                    self.on_timer_overflow(i as u8);
                     if (ctrl & (1 << 6)) != 0 {
                         self.request_interrupt(TIMER_IRQ_MASKS[i]);
                     }
@@ -985,6 +1024,21 @@ impl Bus {
     }
 
     fn handle_side_effects_16(&mut self, addr: u32, old_value: u16, value: u16) {
+        if addr == REG_SOUNDCNT_H {
+            if (value & (1 << 11)) != 0 {
+                self.direct_sound.fifo_a.clear();
+                self.direct_sound.sample_a = 0;
+            }
+            if (value & (1 << 15)) != 0 {
+                self.direct_sound.fifo_b.clear();
+                self.direct_sound.sample_b = 0;
+            }
+            if (value & ((1 << 11) | (1 << 15))) != 0 {
+                // Hardware auto-clears FIFO reset bits.
+                self.write_io16_raw(REG_SOUNDCNT_H, value & !((1 << 11) | (1 << 15)));
+            }
+        }
+
         if addr == REG_SIOCNT {
             // BIOS helper uses multiplayer+IRQ mode and waits on the serial IRQ path.
             // With no link partner modeled, emulate immediate completion so BIOS can
@@ -1048,6 +1102,36 @@ impl Bus {
                 let counter_addr = IO_START + TIMER_RELOAD_OFFSETS[idx];
                 self.write_io16_raw(counter_addr, self.timers[idx].reload);
             }
+        }
+    }
+
+    pub fn direct_sound_samples(&self) -> (i8, i8) {
+        (self.direct_sound.sample_a, self.direct_sound.sample_b)
+    }
+
+    fn push_direct_sound_byte(&mut self, addr: u32, value: u8) {
+        let fifo = if addr == REG_FIFO_A_L {
+            &mut self.direct_sound.fifo_a
+        } else {
+            &mut self.direct_sound.fifo_b
+        };
+
+        if fifo.len() >= 32 {
+            let _ = fifo.pop_front();
+        }
+        fifo.push_back(value as i8);
+    }
+
+    fn on_timer_overflow(&mut self, timer_idx: u8) {
+        let cnt_h = self.read_io16_raw(REG_SOUNDCNT_H);
+        let timer_a = ((cnt_h >> 10) & 0x1) as u8;
+        let timer_b = ((cnt_h >> 14) & 0x1) as u8;
+
+        if timer_idx == timer_a {
+            self.direct_sound.sample_a = self.direct_sound.fifo_a.pop_front().unwrap_or(0);
+        }
+        if timer_idx == timer_b {
+            self.direct_sound.sample_b = self.direct_sound.fifo_b.pop_front().unwrap_or(0);
         }
     }
 
