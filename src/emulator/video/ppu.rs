@@ -598,13 +598,14 @@ impl Ppu {
 
             let obj_mode = (attr0 >> 8) & 0x3;
             let is_affine = (attr0 & (1 << 8)) != 0;
+            let affine_double = is_affine && (attr0 & (1 << 9)) != 0;
             let mosaic = (attr0 & (1 << 12)) != 0;
             let is_8bpp = (attr0 & (1 << 13)) != 0;
             let shape = (attr0 >> 14) & 0x3;
             let size = (attr1 >> 14) & 0x3;
 
-            // Skip prohibited, object-window, affine and mosaic for now.
-            if obj_mode == 0b10 || shape == 0b11 || is_affine || mosaic {
+            // Skip prohibited/object-window and mosaic for now.
+            if obj_mode == 0b10 || shape == 0b11 || mosaic {
                 continue;
             }
 
@@ -619,20 +620,18 @@ impl Ppu {
                 obj_x = obj_x.wrapping_sub(512);
             }
 
-            if !scanline_hits_obj(y_u16, obj_y, height as u16) {
-                continue;
-            }
+            let draw_width = if affine_double { width * 2 } else { width };
+            let draw_height = if affine_double { height * 2 } else { height };
 
-            let mut in_obj_y = y_u16.wrapping_sub(obj_y) as usize;
-            let vflip = (attr1 & (1 << 13)) != 0;
-            if vflip {
-                in_obj_y = height - 1 - in_obj_y;
+            if !scanline_hits_obj(y_u16, obj_y, draw_height as u16) {
+                continue;
             }
 
             let tile_index = (attr2 & 0x03FF) as usize;
             let obj_prio = ((attr2 >> 10) & 0x3) as u8;
             let palette_bank = ((attr2 >> 12) & 0xF) as usize;
             let hflip = (attr1 & (1 << 12)) != 0;
+            let vflip = (attr1 & (1 << 13)) != 0;
             let units_per_tile = if is_8bpp { 2usize } else { 1usize };
             let row_units = if one_dim_obj {
                 (width / 8) * units_per_tile
@@ -640,13 +639,47 @@ impl Ppu {
                 32usize
             };
 
-            for sx in 0..width {
+            let aff_param_idx = ((attr1 >> 9) & 0x1F) as usize;
+            let (pa, pb, pc, pd) = if is_affine {
+                read_obj_affine_params(bus, aff_param_idx)
+            } else {
+                (0, 0, 0, 0)
+            };
+
+            let y_in_draw = y_u16.wrapping_sub(obj_y) as usize;
+
+            for sx in 0..draw_width {
                 let screen_x = (obj_x as i32) + (sx as i32);
                 if !(0..SCREEN_WIDTH as i32).contains(&screen_x) {
                     continue;
                 }
 
-                let in_obj_x = if hflip { width - 1 - sx } else { sx };
+                let (in_obj_x, in_obj_y) = if is_affine {
+                    let cx_draw = (draw_width / 2) as i32;
+                    let cy_draw = (draw_height / 2) as i32;
+                    let x_rel = sx as i32 - cx_draw;
+                    let y_rel = y_in_draw as i32 - cy_draw;
+
+                    let src_x = ((pa as i32 * x_rel + pb as i32 * y_rel) >> 8) + (width as i32 / 2);
+                    let src_y = ((pc as i32 * x_rel + pd as i32 * y_rel) >> 8) + (height as i32 / 2);
+
+                    if src_x < 0 || src_y < 0 || src_x >= width as i32 || src_y >= height as i32 {
+                        continue;
+                    }
+
+                    (src_x as usize, src_y as usize)
+                } else {
+                    let mut x_src = sx;
+                    let mut y_src = y_in_draw;
+                    if hflip {
+                        x_src = width - 1 - x_src;
+                    }
+                    if vflip {
+                        y_src = height - 1 - y_src;
+                    }
+                    (x_src, y_src)
+                };
+
                 let tile_x = in_obj_x / 8;
                 let tile_y = in_obj_y / 8;
                 let pixel_x = in_obj_x % 8;
@@ -775,4 +808,13 @@ fn scanline_hits_obj(scanline: u16, obj_y: u16, height: u16) -> bool {
     } else {
         scanline >= obj_y && scanline < end
     }
+}
+
+fn read_obj_affine_params(bus: &Bus, param_index: usize) -> (i16, i16, i16, i16) {
+    let base = OAM_START + (param_index as u32) * 32;
+    let pa = bus.read16(base + 0x06) as i16;
+    let pb = bus.read16(base + 0x0E) as i16;
+    let pc = bus.read16(base + 0x16) as i16;
+    let pd = bus.read16(base + 0x1E) as i16;
+    (pa, pb, pc, pd)
 }
