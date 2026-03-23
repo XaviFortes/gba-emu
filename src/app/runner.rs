@@ -5,7 +5,7 @@ use gba_emu::emulator::{
     BUTTON_A, BUTTON_B, BUTTON_DOWN, BUTTON_L, BUTTON_LEFT, BUTTON_R, BUTTON_RIGHT,
     BUTTON_SELECT, BUTTON_START, BUTTON_UP, Gba, SCREEN_HEIGHT, SCREEN_WIDTH,
 };
-use minifb::{Key, Scale, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
 
 use super::cli::CliArgs;
 use super::debug::{log_snapshot, update_progress, DebugOptions, ProgressState};
@@ -48,7 +48,20 @@ fn key_mask_from_window(window: &Window) -> u16 {
     mask
 }
 
-fn run_windowed(gba: &mut Gba, debug: DebugOptions, scale: Scale) -> Result<(), String> {
+fn normalize_speed(multiplier: u32) -> u32 {
+    if (1..=3).contains(&multiplier) {
+        multiplier
+    } else {
+        1
+    }
+}
+
+fn run_windowed(
+    gba: &mut Gba,
+    debug: DebugOptions,
+    scale: Scale,
+    speed_multiplier: u32,
+) -> Result<(), String> {
     let mut window = Window::new(
         "GBA Emulator (Rust)",
         SCREEN_WIDTH,
@@ -68,28 +81,41 @@ fn run_windowed(gba: &mut Gba, debug: DebugOptions, scale: Scale) -> Result<(), 
         same_pc_frames: 0,
     };
     let mut bios_frames = 0u32;
+    let mut speed = normalize_speed(speed_multiplier);
+    println!("[speed] window speed x{speed} (Tab cycles x1/x2/x3)");
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        frame = frame.wrapping_add(1);
-        let held = key_mask_from_window(&window);
-        gba.set_input_held_mask(held);
-        gba.run_frame();
-
-        let snap = gba.debug_snapshot();
-        update_progress("window", frame, snap, debug, &mut progress);
-
-        if snap.pc < 0x0000_4000 {
-            bios_frames = bios_frames.saturating_add(1);
-        } else {
-            bios_frames = 0;
+        if window.is_key_pressed(Key::Tab, KeyRepeat::No) {
+            speed = match speed {
+                1 => 2,
+                2 => 3,
+                _ => 1,
+            };
+            println!("[speed] switched to x{speed}");
         }
 
-        if let Some(limit) = debug.bios_watchdog_frames {
-            if limit != 0 && bios_frames == limit {
-                println!(
-                    "[window] bios-watchdog triggered at frame={frame}; switching to no-BIOS ROM boot"
-                );
-                gba.force_boot_to_rom_without_bios();
+        for _ in 0..speed {
+            frame = frame.wrapping_add(1);
+            let held = key_mask_from_window(&window);
+            gba.set_input_held_mask(held);
+            gba.run_frame();
+
+            let snap = gba.debug_snapshot();
+            update_progress("window", frame, snap, debug, &mut progress);
+
+            if snap.pc < 0x0000_4000 {
+                bios_frames = bios_frames.saturating_add(1);
+            } else {
+                bios_frames = 0;
+            }
+
+            if let Some(limit) = debug.bios_watchdog_frames {
+                if limit != 0 && bios_frames == limit {
+                    println!(
+                        "[window] bios-watchdog triggered at frame={frame}; switching to no-BIOS ROM boot"
+                    );
+                    gba.force_boot_to_rom_without_bios();
+                }
             }
         }
 
@@ -270,7 +296,12 @@ pub fn run(args: CliArgs) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if let Err(err) = run_windowed(&mut gba, debug, selection.scale) {
+    if let Err(err) = run_windowed(
+        &mut gba,
+        debug,
+        selection.scale,
+        args.speed_multiplier.unwrap_or(1),
+    ) {
         eprintln!("{err}");
         return ExitCode::from(1);
     }

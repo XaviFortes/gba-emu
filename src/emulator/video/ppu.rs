@@ -1,7 +1,8 @@
 use std::sync::OnceLock;
 
 use crate::emulator::core::bus::{
-    Bus, IRQ_VBLANK, OAM_START, PALETTE_RAM_START, REG_DISPCNT, REG_DISPSTAT, REG_VCOUNT,
+    Bus, IRQ_HBLANK, IRQ_VBLANK, IRQ_VCOUNT, OAM_START, PALETTE_RAM_START, REG_DISPCNT,
+    REG_DISPSTAT, REG_VCOUNT,
 };
 
 pub const SCREEN_WIDTH: usize = 240;
@@ -106,8 +107,12 @@ impl Ppu {
                 self.render_scanline(bus, vcount as usize);
             }
 
+            // Pulse HBlank once per scanline to drive HBlank-timed DMA/IRQ users.
+            self.pulse_hblank(bus);
+
             vcount = (vcount + 1) % TOTAL_SCANLINES;
             bus.set_vcount(vcount);
+            self.update_vcount_compare(bus, vcount);
 
             if vcount == VISIBLE_SCANLINES {
                 self.set_vblank(bus, true);
@@ -115,6 +120,45 @@ impl Ppu {
             } else if vcount == 0 {
                 self.set_vblank(bus, false);
             }
+        }
+    }
+
+    fn pulse_hblank(&self, bus: &mut Bus) {
+        let mut dispstat = bus.read_io16(REG_DISPSTAT);
+
+        // Enter HBlank.
+        dispstat |= 1 << 1;
+        bus.write_io16(REG_DISPSTAT, dispstat);
+
+        // Start HBlank-timed DMA channels (DMAxCNT_H start timing=10).
+        bus.trigger_dma_timing(0b10);
+
+        // DISPSTAT bit4 enables HBlank IRQ.
+        if (dispstat & (1 << 4)) != 0 {
+            bus.request_interrupt(IRQ_HBLANK);
+        }
+
+        // Exit HBlank immediately (coarse timing model).
+        dispstat &= !(1 << 1);
+        bus.write_io16(REG_DISPSTAT, dispstat);
+    }
+
+    fn update_vcount_compare(&self, bus: &mut Bus, vcount: u16) {
+        let mut dispstat = bus.read_io16(REG_DISPSTAT);
+        let lyc = (dispstat >> 8) & 0x00FF;
+        let vmatch = (vcount & 0x00FF) == lyc;
+
+        let prev_match = (dispstat & (1 << 2)) != 0;
+        if vmatch {
+            dispstat |= 1 << 2;
+        } else {
+            dispstat &= !(1 << 2);
+        }
+        bus.write_io16(REG_DISPSTAT, dispstat);
+
+        // DISPSTAT bit5 enables VCOUNT IRQ; trigger on rising edge of match.
+        if vmatch && !prev_match && (dispstat & (1 << 5)) != 0 {
+            bus.request_interrupt(IRQ_VCOUNT);
         }
     }
 

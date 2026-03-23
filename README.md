@@ -67,6 +67,12 @@ Windowed mode with BIOS:
 cargo run -- --rom <path-to-rom.gba> --bios <path-to-bios.bin>
 ```
 
+Windowed mode with fast-forward speed multiplier:
+
+```bash
+cargo run --release --features audio -- --rom <path-to-rom.gba> --bios <path-to-bios.bin> --speed 2
+```
+
 Open launcher explicitly (Switch-style game browser):
 
 ```bash
@@ -113,6 +119,7 @@ cargo run --release --features audio -- --rom <path-to-rom.gba>
 
 - `--rom <path>`: Optional. ROM file to load directly (skips launcher).
 - `--bios <path>`: Optional BIOS file.
+- `--speed <1..3>`: Windowed emulation speed multiplier (`1=normal`, `2=2x`, `3=3x`).
 - `--launcher`: Force launcher UI mode.
 - `--roms-dir <dir>`: Directory scanned for `.gba` files in launcher mode.
 - `--scale <1..6>`: Window scale preset (`1=X1`, `2=X2`, `3=X4`, `4=X8`, `5=X16`, `6=X32`).
@@ -132,6 +139,7 @@ cargo run --release --features audio -- --rom <path-to-rom.gba>
 - Arrow keys: D-pad
 - `A`: L
 - `S`: R
+- `Tab`: Cycle speed (`x1 -> x2 -> x3`)
 - `Esc`: Exit
 
 ## Launcher Controls

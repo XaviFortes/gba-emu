@@ -5,6 +5,7 @@ use std::process::ExitCode;
 pub struct CliArgs {
     pub rom_path: Option<String>,
     pub bios_path: Option<String>,
+    pub speed_multiplier: Option<u32>,
     pub frames: Option<u32>,
     pub debug_interval: Option<u32>,
     pub stuck_threshold: Option<u32>,
@@ -34,7 +35,7 @@ fn parse_u32_arg(bin: &str, args: &mut env::Args, flag: &str) -> Result<u32, Exi
 
 pub fn print_usage(bin: &str) {
     eprintln!(
-        "Usage: {bin} [--rom <path>] [--bios <path>] [--frames <n>] [--debug-interval <frames>] [--stuck-threshold <frames>] [--bios-watchdog <frames>] [--trace-branches] [--launcher] [--roms-dir <dir>] [--scale <2..6>]"
+        "Usage: {bin} [--rom <path>] [--bios <path>] [--speed <1..3>] [--frames <n>] [--debug-interval <frames>] [--stuck-threshold <frames>] [--bios-watchdog <frames>] [--trace-branches] [--launcher] [--roms-dir <dir>] [--scale <2..6>]"
     );
 }
 
@@ -44,6 +45,7 @@ pub fn parse_args() -> Result<CliArgs, ExitCode> {
 
     let mut rom_path: Option<String> = None;
     let mut bios_path: Option<String> = None;
+    let mut speed_multiplier: Option<u32> = None;
     let mut frames: Option<u32> = None;
     let mut debug_interval: Option<u32> = None;
     let mut stuck_threshold: Option<u32> = None;
@@ -72,6 +74,15 @@ pub fn parse_args() -> Result<CliArgs, ExitCode> {
                 }
             }
             "--frames" => frames = Some(parse_u32_arg(&bin, &mut args, "--frames")?),
+            "--speed" => {
+                let speed = parse_u32_arg(&bin, &mut args, "--speed")?;
+                if !(1..=3).contains(&speed) {
+                    eprintln!("Invalid --speed value: {speed}. Expected range 1..=3");
+                    print_usage(&bin);
+                    return Err(ExitCode::from(2));
+                }
+                speed_multiplier = Some(speed);
+            }
             "--debug-interval" => {
                 debug_interval = Some(parse_u32_arg(&bin, &mut args, "--debug-interval")?)
             }
@@ -123,6 +134,7 @@ pub fn parse_args() -> Result<CliArgs, ExitCode> {
     Ok(CliArgs {
         rom_path,
         bios_path,
+        speed_multiplier,
         frames,
         debug_interval,
         stuck_threshold,
